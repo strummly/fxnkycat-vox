@@ -42,8 +42,47 @@ void SwitchButton::paintButton (juce::Graphics& g, bool highlighted, bool)
 }
 
 //------------------------------------------------------------------------------
-LabeledControl::LabeledControl (const juce::String& caption, std::unique_ptr<juce::Component> c, bool isCompact)
-    : control (std::move (c)), compact (isCompact)
+void KnobLookAndFeel::drawRotarySlider (juce::Graphics& g, int x, int y, int w, int h, float pos,
+                                        float startAngle, float endAngle, juce::Slider& s)
+{
+    if (! (bool) s.getProperties().getWithDefault ("fillRight", false))
+    {
+        LookAndFeel_V4::drawRotarySlider (g, x, y, w, h, pos, startAngle, endAngle, s);
+        return;
+    }
+
+    // Same look as LookAndFeel_V4, but the value arc runs from the pointer to the end.
+    const auto bounds = juce::Rectangle<int> (x, y, w, h).toFloat().reduced (10.0f);
+    const float radius  = juce::jmin (bounds.getWidth(), bounds.getHeight()) / 2.0f;
+    const float toAngle = startAngle + pos * (endAngle - startAngle);
+    const float lineW   = juce::jmin (8.0f, radius * 0.5f);
+    const float arcR    = radius - lineW * 0.5f;
+    const juce::PathStrokeType stroke (lineW, juce::PathStrokeType::curved, juce::PathStrokeType::rounded);
+
+    juce::Path back;
+    back.addCentredArc (bounds.getCentreX(), bounds.getCentreY(), arcR, arcR, 0.0f, startAngle, endAngle, true);
+    g.setColour (s.findColour (juce::Slider::rotarySliderOutlineColourId));
+    g.strokePath (back, stroke);
+
+    if (s.isEnabled() && pos < 1.0f)
+    {
+        juce::Path value;
+        value.addCentredArc (bounds.getCentreX(), bounds.getCentreY(), arcR, arcR, 0.0f, toAngle, endAngle, true);
+        g.setColour (s.findColour (juce::Slider::rotarySliderFillColourId));
+        g.strokePath (value, stroke);
+    }
+
+    const float thumbW = lineW * 2.0f;
+    const juce::Point<float> thumb (bounds.getCentreX() + arcR * std::cos (toAngle - juce::MathConstants<float>::halfPi),
+                                    bounds.getCentreY() + arcR * std::sin (toAngle - juce::MathConstants<float>::halfPi));
+    g.setColour (s.findColour (juce::Slider::thumbColourId));
+    g.fillEllipse (juce::Rectangle<float> (thumbW, thumbW).withCentre (thumb));
+}
+
+//------------------------------------------------------------------------------
+LabeledControl::LabeledControl (const juce::String& caption, std::unique_ptr<juce::Component> c, bool isCompact,
+                                int compactMaxWidth)
+    : control (std::move (c)), compact (isCompact), maxWidth (compactMaxWidth)
 {
     label.setText (caption, juce::dontSendNotification);
     label.setJustificationType (juce::Justification::centred);
@@ -58,7 +97,8 @@ void LabeledControl::resized()
     auto r = getLocalBounds();
     label.setBounds (r.removeFromTop (18));
     if (compact)
-        control->setBounds (r.withSizeKeepingCentre (juce::jmin (r.getWidth() - 8, 130), 28));
+        control->setBounds (r.withSizeKeepingCentre (juce::jmin (r.getWidth() - 8, maxWidth),
+                                                     juce::jmin (r.getHeight(), controlHeight)));
     else
         control->setBounds (r.reduced (2));
 }
@@ -78,11 +118,13 @@ void SegmentedSwitch::paint (juce::Graphics& g)
     g.fillRoundedRectangle (r, 5.0f);
 
     const int n = juce::jmax (1, options.size());
-    const float w = r.getWidth() / (float) n;
+    const float w = r.getWidth() / (float) n, h = r.getHeight() / (float) n;
     g.setFont (juce::FontOptions (12.0f, juce::Font::bold));
     for (int i = 0; i < n; ++i)
     {
-        auto seg = juce::Rectangle<float> (r.getX() + w * (float) i, r.getY(), w, r.getHeight());
+        const int s = slotFor (i);
+        auto seg = vertical ? juce::Rectangle<float> (r.getX(), r.getY() + h * (float) s, r.getWidth(), h)
+                            : juce::Rectangle<float> (r.getX() + w * (float) s, r.getY(), w, r.getHeight());
         if (i == selected)
         {
             g.setColour (accent);
@@ -96,7 +138,8 @@ void SegmentedSwitch::paint (juce::Graphics& g)
 void SegmentedSwitch::mouseDown (const juce::MouseEvent& e)
 {
     const int n = juce::jmax (1, options.size());
-    const int idx = juce::jlimit (0, n - 1, (int) ((float) e.x / (float) getWidth() * (float) n));
+    const float pos = vertical ? (float) e.y / (float) getHeight() : (float) e.x / (float) getWidth();
+    const int idx = slotFor (juce::jlimit (0, n - 1, (int) (pos * (float) n)));
     attachment.setValueAsCompleteGesture ((float) idx);
 }
 
@@ -191,11 +234,70 @@ void SpectrumAnalyzer::paint (juce::Graphics& g)
 
     auto a = outer.reduced (36.0f, 22.0f).withTrimmedLeft (-8.0f);
 
-    // Watermark: the logo, very faint and centred, sitting under the grid and traces
-    if (watermark.isValid())
+    // Watermark: logo + plugin name side by side, very faint and centred, under the grid and traces.
+    // The name is stacked one word per line (FXNKYCAT over VOX).
     {
+        const auto wm = outer.reduced (12.0f);
+        const float logoSize = watermark.isValid() ? wm.getHeight() : 0.0f;
+        const float gap = (logoSize > 0.0f && watermarkText.isNotEmpty()) ? wm.getHeight() * 0.04f : 0.0f;
+        const auto lines = juce::StringArray::fromTokens (watermarkText, " ", {});
+        const int nLines = juce::jmax (1, lines.size());
+
+        // Letter shapes per unit of font height: where the capitals start and end relative to the baseline.
+        juce::Font font (juce::FontOptions (100.0f, juce::Font::bold));
+        juce::Rectangle<float> ink;
+        {
+            juce::GlyphArrangement ga;
+            ga.addLineOfText (font, lines.joinIntoString (""), 0.0f, 0.0f);
+            juce::Path p; ga.createPath (p);
+            ink = p.getBounds() / 100.0f;   // ink.getY() < 0 (above baseline), ink.getBottom() ~ 0
+        }
+        const float inkTop = -ink.getY(), inkH = juce::jmax (0.01f, ink.getHeight());
+
+        // Outer edges stay where the original layout put them (lines of 0.88 x height / n,
+        // font 1.05 x line); only the gap between the words shrinks as the letters grow.
+        const float oldLineH = wm.getHeight() * 0.88f / (float) nLines, oldF = oldLineH * 1.05f;
+        const float oldBaseline0 = wm.getCentreY() - oldLineH * (float) nLines * 0.5f
+                                 + (oldLineH - oldF) * 0.5f + font.getAscent() / 100.0f * oldF;
+        const float blockTop    = oldBaseline0 - inkTop * oldF;
+        const float blockBottom = oldBaseline0 + oldLineH * (float) (nLines - 1) + (ink.getBottom()) * oldF;
+
+        constexpr float wordGap = 0.08f;   // space between the words, as a fraction of the letter height
+        const float capH  = (blockBottom - blockTop) / ((float) nLines + wordGap * (float) (nLines - 1));
+        const float fontH = capH / inkH, pitch = capH * (1.0f + wordGap);
+        font = font.withHeight (fontH);
+        float textW = 0.0f;
+        for (auto& l : lines)
+            textW = juce::jmax (textW, juce::GlyphArrangement::getStringWidth (font, l));
+
+        // Logo stays centred; the name sits to its left. Shrink everything if the
+        // left half of the analyzer is too narrow for half the logo + gap + name.
+        float scale = 1.0f;
+        const float need = logoSize * 0.5f + gap + textW;
+        if (need > wm.getWidth() * 0.5f)
+            scale = wm.getWidth() * 0.5f / need;
+        const float ls = logoSize * scale, gp = gap * scale, tw = textW * scale;
+        font = font.withHeight (font.getHeight() * scale);
+
+        const float logoX = wm.getCentreX() - ls * 0.5f;
         g.setColour (textCol.withAlpha (0.07f));
-        g.drawImage (watermark, outer.reduced (8.0f), juce::RectanglePlacement::centred, true);
+        if (ls > 0.0f)
+            g.drawImage (watermark, { logoX, wm.getCentreY() - ls * 0.5f, ls, ls }, juce::RectanglePlacement::centred, true);
+        if (tw > 0.0f)
+        {
+            // Right-aligned against the logo, so VOX ends under the T of FXNKYCAT.
+            const float right = logoX - gp;
+            const float top = wm.getCentreY() + (blockTop - wm.getCentreY()) * scale;
+            float baseline = top + inkTop * fontH * scale;
+            juce::GlyphArrangement ga;
+            for (auto& l : lines)
+            {
+                const float w = juce::GlyphArrangement::getStringWidth (font, l);
+                ga.addLineOfText (font, l, right - w, baseline);
+                baseline += pitch * scale;
+            }
+            ga.draw (g);
+        }
     }
 
     // Grid
@@ -285,6 +387,14 @@ void ModulePanel::setActivity (float v)
     repaint (meterArea().expanded (2.0f).getSmallestIntegerContainer());
 }
 
+void ModulePanel::setActivity2 (float v)
+{
+    if (std::abs (v - activity2) < 0.004f) return;
+    activity2 = v;
+    repaint (ledArea().expanded (8.0f).getSmallestIntegerContainer());
+    repaint (meterArea().expanded (2.0f).getSmallestIntegerContainer());
+}
+
 void ModulePanel::paint (juce::Graphics& g)
 {
     auto r = getLocalBounds().toFloat().reduced (4.0f);
@@ -295,27 +405,42 @@ void ModulePanel::paint (juce::Graphics& g)
 
     // Activity LED: dark when idle, glows brighter the harder the stage works.
     const auto led = ledArea();
-    const float a = enable.getToggleState() ? activity : 0.0f;
+    const bool  isOn = enable.getToggleState();
+    const float a  = isOn ? activity : 0.0f;
+    const float a2 = isOn && splitMeter ? activity2 : 0.0f;
     const juce::Colour hot { 0xffff7a3d };
-    if (a > 0.02f)
+    const float la = ledFollowsBoth ? juce::jmax (a, a2) : a;
+    if (la > 0.02f)
     {
-        g.setColour (hot.withAlpha (0.35f * a));
-        g.fillEllipse (led.expanded (5.0f * a));   // glow
+        g.setColour (hot.withAlpha (0.35f * la));
+        g.fillEllipse (led.expanded (5.0f * la));   // glow
     }
-    g.setColour (edge.interpolatedWith (hot, a));
+    g.setColour (edge.interpolatedWith (hot, la));
     g.fillEllipse (led);
     g.setColour (bg.withAlpha (0.6f));
     g.drawEllipse (led, 1.0f);
 
-    // Activity meter bar
-    const auto m = meterArea();
-    g.setColour (bg);
-    g.fillRoundedRectangle (m, 1.5f);
-    if (a > 0.0f)
+    // Activity meter bar (or two side by side: left = activity2, right = activity)
+    auto drawBar = [&] (juce::Rectangle<float> m, float v)
     {
-        g.setColour (accent.interpolatedWith (hot, a));
-        g.fillRoundedRectangle (m.withWidth (m.getWidth() * a), 1.5f);
+        g.setColour (bg);
+        g.fillRoundedRectangle (m, 1.5f);
+        if (v > 0.0f)
+        {
+            g.setColour (accent.interpolatedWith (hot, v));
+            g.fillRoundedRectangle (m.withWidth (m.getWidth() * v), 1.5f);
+        }
+    };
+    if (splitMeter)
+    {
+        auto m = meterArea();
+        constexpr float barGap = 8.0f;
+        const float half = (m.getWidth() - barGap) * 0.5f;
+        drawBar (m.removeFromLeft (half), a2);
+        drawBar (m.removeFromRight (half), a);
     }
+    else
+        drawBar (meterArea(), a);
 
     auto header = getLocalBounds().reduced (14, 10).removeFromTop (34).withTrimmedRight (80);  // leave room for LED + ON
     g.setColour (accent);
@@ -339,6 +464,19 @@ void ModulePanel::resized()
 
     const int n = (int) controls.size();
     if (n == 0) return;
+
+    if (sideStack && n > 1)
+    {
+        // Left column: every control but the last, stacked top to bottom. Right: the last one.
+        auto left = r.removeFromLeft (r.getWidth() / 2);
+        controls.back()->setBounds (r);
+        const int stackH = juce::jmin (left.getHeight() / (n - 1), 110);
+        left = left.withSizeKeepingCentre (left.getWidth(), stackH * (n - 1));
+        for (int i = 0; i < n - 1; ++i)
+            controls[(size_t) i]->setBounds (left.removeFromTop (stackH));
+        return;
+    }
+
     const int cols = (n + rows - 1) / rows;
     const int cw = r.getWidth() / cols, rh = r.getHeight() / rows;
 
@@ -355,11 +493,11 @@ VocalChainEditor::VocalChainEditor (VocalChainProcessor& p)
     : AudioProcessorEditor (p), proc (p),
       rider     ("1", "Volume Rider",    "Rides level to target  |  synced timing", 1),
       comp1     ("2", "Comp-Gate",       "Classic de-ess + gate", 1),
-      problemEQ ("3", "Problem EQ",      "Finds and cuts resonances: low, mid, high", 1),
+      problemEQ ("3", "Problem EQ",      "Finds and cuts resonances: low, mid, high", 2),
       deEsser   ("4", "De-Esser",        "Finds the strongest S / SH and cuts it", 1),
       pultec    ("5", "Pultec EQ",       "EQP-1A style program equalizer", 2),
-      comp2     ("6", "Compressor",      "Fast attack  |  synced auto release", 1),
-      tape      ("7", "Tape",            "Analog tape saturation", 1),
+      comp2     ("6", "Compressor",      "Fast attack  |  auto release  |  auto makeup", 1),
+      tape      ("7", "Tape",            "Analog tape saturation", 2),
       delay     ("8", "Delay",           "Synced to project tempo", 2),
       filters   ("9", "Filters",         "High / low pass, 24 dB/oct", 1),
       analyzer  (p)
@@ -378,11 +516,11 @@ VocalChainEditor::VocalChainEditor (VocalChainProcessor& p)
     lnf.setColour (juce::PopupMenu::highlightedTextColourId, bg);
     setLookAndFeel (&lnf);
 
-    analyzer.setWatermark (juce::ImageCache::getFromMemory (BinaryData::logo_png, BinaryData::logo_pngSize));
-
+    analyzer.setWatermark (juce::ImageCache::getFromMemory (BinaryData::logo_png, BinaryData::logo_pngSize), "FXNKYCAT VOX");
     // 1. Volume rider
     rider.add (knob ("riderThresh", "Threshold"));
     rider.add (knob ("riderTarget", "Target Loudness"));
+    rider.setSplitMeter (true);   // left bar: level over threshold, right bar: how much it rides
     bindEnable (rider, "riderOn");
 
     // 2. Light compressor
@@ -390,13 +528,23 @@ VocalChainEditor::VocalChainEditor (VocalChainProcessor& p)
     bindEnable (comp1, "comp1On");
 
     // 3. Problem EQ
+    if (auto* range = dynamic_cast<juce::AudioParameterChoice*> (proc.apvts.getParameter ("deqRange")))
+    {
+        auto sw = std::make_unique<ui::SegmentedSwitch> (*range);
+        sw->setVertical (true);
+        sw->setReversed (true);   // Mezzo/Soprano on top, Bass/Baritone at the bottom
+        auto lc = std::make_unique<ui::LabeledControl> ("Vocal Range", std::move (sw), true, 150);
+        lc->setControlHeight (84);
+        problemEQ.add (std::move (lc));
+    }
     problemEQ.add (knob ("deqThresh", "Threshold"));
-    problemEQ.add (toggle ("deqFemale", "Voice", "MALE", "FEMALE"));
+    problemEQ.setSideStack (true);
     bindEnable (problemEQ, "deqOn");
 
     // 4. De-esser
     deEsser.add (knob ("deessSens", "Detection"));
     deEsser.add (knob ("deessReduce", "Reduction"));
+    deEsser.setSplitMeter (true);   // left bar: detection, right bar: reduction
     bindEnable (deEsser, "deessOn");
 
     // 5. Pultec — laid out like the hardware: low section on top, high section below.
@@ -408,22 +556,25 @@ VocalChainEditor::VocalChainEditor (VocalChainProcessor& p)
     pultec.add (knob ("pHighBoost", "High Boost"));
     pultec.add (knob ("pBandwidth", "Bandwidth (Sharp-Broad)"));
     pultec.add (knob ("pHighAtten", "High Atten"));
+    pultec.setSplitMeter (true, true);   // left bar: low boost, right bar: high boost
     bindEnable (pultec, "pultecOn");
 
     // 6. Compressor
     comp2.add (toggle ("comp2Ratio4", "Ratio", "3:1", "4:1"));
+    comp2.add (toggle ("comp2SlowRel", "Release", "FAST", "SLOW"));
     comp2.add (knob ("comp2Thresh", "Threshold"));
-    comp2.add (knob ("comp2Makeup", "Makeup Gain"));
+    comp2.setSideStack (true);
     bindEnable (comp2, "comp2On");
 
     // 7. Tape saturation
+    tape.add (toggle ("tapeOD", "Overdrive", "OFF", "ON"));
     tape.add (knob ("tapeAmount", "Saturation"));
     bindEnable (tape, "tapeOn");
 
-    // 8. Delay: 1/8 | 1/4 | 1/2 switch, then amount
+    // 8. Delay: 1/8 | 1/4 | 1/2 switch, then dry/wet mix
     if (auto* div = dynamic_cast<juce::AudioParameterChoice*> (proc.apvts.getParameter ("delayDiv")))
         delay.add (std::make_unique<ui::LabeledControl> ("Time", std::make_unique<ui::SegmentedSwitch> (*div), true));
-    delay.add (knob ("delayAmount", "Amount"));
+    delay.add (knob ("delayMix", "Mix"));
     bindEnable (delay, "delayOn");
 
     // 9. High / low pass
@@ -458,12 +609,27 @@ VocalChainEditor::VocalChainEditor (VocalChainProcessor& p)
     bpmLabel.setFont (juce::FontOptions (12.5f, juce::Font::bold));
     addAndMakeVisible (bpmLabel);
 
+    // Output auto gain switch, top bar
+    buttonAtts.push_back (std::make_unique<APVTS::ButtonAttachment> (proc.apvts, "autoGain", autoGainButton));
+    addAndMakeVisible (autoGainButton);
+
+    // Presets: pick a slot to load it; SAVE stores the current settings in a slot.
+    presetBox.setTextWhenNothingSelected ("Choose preset...");
+    presetBox.setTextWhenNoChoicesAvailable ("No presets");
+    presetBox.onChange = [this] { presetChosen(); };
+    addAndMakeVisible (presetBox);
+    saveButton.setColour (juce::TextButton::buttonColourId, edge);
+    saveButton.setColour (juce::TextButton::textColourOffId, accent);
+    saveButton.onClick = [this] { showSaveDialog(); };
+    addAndMakeVisible (saveButton);
+    refreshPresetList();
+
     addAndMakeVisible (analyzer);
 
     // Resizable from the bottom-right corner; panels, knobs and analyzer scale with the window.
     setResizable (true, true);
-    setResizeLimits (1280, 780, 2680, 1600);
-    setSize (1400, 912);
+    setResizeLimits (1300, 790, 2680, 1600);
+    setSize (1400, 900);
     startTimerHz (30);
 }
 
@@ -479,12 +645,17 @@ void VocalChainEditor::timerCallback()
         shownActivity[s] = juce::jmax (v, shownActivity[s] * 0.82f);
         if (shownActivity[s] < 0.01f) shownActivity[s] = 0.0f;
         panels[s]->setActivity (shownActivity[s]);
+
+        // Left-hand bar of split meters (ignored by panels without one)
+        shownActivity2[s] = juce::jmax (proc.activity2[s].exchange (0.0f), shownActivity2[s] * 0.82f);
+        if (shownActivity2[s] < 0.01f) shownActivity2[s] = 0.0f;
+        panels[s]->setActivity2 (shownActivity2[s]);
     }
 
     if (swapButton.getToggleState() != swapped)
         applySwap (swapButton.getToggleState());
 
-    const auto bpmText = juce::String (proc.hostBpm.load(), 1) + " BPM (project)";
+    const auto bpmText = juce::String (proc.hostBpm.load(), 1) + " BPM";
     if (bpmLabel.getText() != bpmText)
         bpmLabel.setText (bpmText, juce::dontSendNotification);
 }
@@ -496,6 +667,65 @@ void VocalChainEditor::applySwap (bool s)
     comp2.setNumber  (s ? "5" : "6");
     if (getWidth() > 0) resized();
     repaint();
+}
+
+//------------------------------------------------------------------------------
+// Presets
+void VocalChainEditor::refreshPresetList (int selectSlot)
+{
+    presetBox.clear (juce::dontSendNotification);
+    for (int s = 0; s < VocalChainProcessor::kNumPresets; ++s)
+    {
+        const auto name = proc.presetName (s);
+        presetBox.addItem (juce::String (s + 1) + "   " + (name.isEmpty() ? "(empty)" : name), s + 1);
+        presetBox.setItemEnabled (s + 1, name.isNotEmpty());   // empty slots can't be loaded
+    }
+    if (selectSlot >= 0)
+        presetBox.setSelectedId (selectSlot + 1, juce::dontSendNotification);
+}
+
+void VocalChainEditor::presetChosen()
+{
+    const int slot = presetBox.getSelectedId() - 1;
+    if (slot >= 0 && ! proc.loadPreset (slot))
+        presetBox.setSelectedId (0, juce::dontSendNotification);
+}
+
+void VocalChainEditor::showSaveDialog()
+{
+    auto* w = new juce::AlertWindow ("Save preset", "Name it and choose one of the 10 slots.",
+                                     juce::MessageBoxIconType::NoIcon, this);
+    w->setLookAndFeel (&lnf);
+
+    const int current = presetBox.getSelectedId() - 1;
+    w->addTextEditor ("name", current >= 0 ? proc.presetName (current) : juce::String(), "Preset name:");
+
+    juce::StringArray slots;
+    int firstEmpty = -1;
+    for (int s = 0; s < VocalChainProcessor::kNumPresets; ++s)
+    {
+        const auto name = proc.presetName (s);
+        if (name.isEmpty() && firstEmpty < 0) firstEmpty = s;
+        slots.add ("Slot " + juce::String (s + 1) + (name.isEmpty() ? "  (empty)" : "  (replace \"" + name + "\")"));
+    }
+    w->addComboBox ("slot", slots, "Save to:");
+    w->getComboBoxComponent ("slot")->setSelectedItemIndex (current >= 0 ? current : juce::jmax (0, firstEmpty));
+
+    w->addButton ("Save", 1, juce::KeyPress (juce::KeyPress::returnKey));
+    w->addButton ("Cancel", 0, juce::KeyPress (juce::KeyPress::escapeKey));
+
+    juce::Component::SafePointer<VocalChainEditor> safeThis (this);
+    w->enterModalState (true, juce::ModalCallbackFunction::create ([safeThis, w] (int result)
+    {
+        if (result == 1 && safeThis != nullptr)
+        {
+            const int slot = w->getComboBoxComponent ("slot")->getSelectedItemIndex();
+            const auto name = w->getTextEditorContents ("name");
+            if (safeThis->proc.savePreset (slot, name))
+                safeThis->refreshPresetList (slot);
+        }
+        w->setLookAndFeel (nullptr);
+    }), true);
 }
 
 VocalChainEditor::~VocalChainEditor()
@@ -511,6 +741,8 @@ std::unique_ptr<ui::LabeledControl> VocalChainEditor::knob (const char* id, cons
 {
     auto s = std::make_unique<juce::Slider> (juce::Slider::RotaryHorizontalVerticalDrag, juce::Slider::TextBoxBelow);
     s->setTextBoxStyle (juce::Slider::TextBoxBelow, false, 80, 20);
+    if (juce::String (id).endsWith ("Thresh"))
+        s->getProperties().set ("fillRight", true);   // gold arc from the pointer to the right end
     sliderAtts.push_back (std::make_unique<APVTS::SliderAttachment> (proc.apvts, id, *s));
     return std::make_unique<ui::LabeledControl> (caption, std::move (s), false);
 }
@@ -543,44 +775,45 @@ void VocalChainEditor::paint (juce::Graphics& g)
 {
     g.fillAll (bg);
 
-    g.setColour (textCol);
-    g.setFont (juce::FontOptions (20.0f, juce::Font::bold));
-    g.drawText ("FXNKYCAT VOX", hdrTitle, juce::Justification::bottomLeft);
-
     g.setColour (accent);
     g.setFont (juce::FontOptions (12.0f, juce::Font::bold));
-    g.drawText ("INPUT HPF", capHpf,    juce::Justification::centredRight);
-    g.drawText ("5/6 ORDER", capSwap,   juce::Justification::centredRight);
-    g.drawText ("TIMING",    capTiming, juce::Justification::centredRight);
+    g.drawText ("INPUT HPF", capHpf,      juce::Justification::centredRight);
+    g.drawText ("5/6 ORDER", capSwap,     juce::Justification::centredRight);
+    g.drawText ("TIMING",    capTiming,   juce::Justification::centredRight);
+    g.drawText ("PRESET",    capPreset,   juce::Justification::centredRight);
+    g.drawText ("AUTO GAIN", capAutoGain, juce::Justification::centredRight);
 
-    g.setColour (dimText);
-    g.setFont (juce::FontOptions (11.5f));
-    const juce::String mid = swapped ? "Compressor > Pultec" : "Pultec > Compressor";
-    g.drawFittedText ("HPF > Rider > Comp-Gate > Problem EQ > De-Esser > " + mid + " > Tape > Delay > Filters",
-                      hdrChain, juce::Justification::centredLeft, 1, 0.7f);
+    // Thin divider under the top bar
+    g.setColour (edge);
+    g.fillRect (hdrDivider);
 }
 
 void VocalChainEditor::resized()
 {
     auto r = getLocalBounds().reduced (10, 0);
-    auto header = r.removeFromTop (64).reduced (8, 0);
+    auto top = r.removeFromTop (52).reduced (8, 4);
+    hdrDivider = { r.getX() + 8, r.getY() - 1, r.getWidth() - 16, 1 };
 
-    // Right side of the top bar, right to left
-    bpmLabel.setBounds   (header.removeFromRight (130).withSizeKeepingCentre (130, 30));
-    header.removeFromRight (8);
-    timingBox.setBounds  (header.removeFromRight (110).withSizeKeepingCentre (110, 32));
-    capTiming = header.removeFromRight (64);
-    header.removeFromRight (12);
-    swapButton.setBounds (header.removeFromRight (156).withSizeKeepingCentre (156, 28));
-    capSwap = header.removeFromRight (84);
-    header.removeFromRight (12);
-    inHpfSlider.setBounds (header.removeFromRight (180).withSizeKeepingCentre (180, 26));
-    capHpf = header.removeFromRight (78);
-    header.removeFromRight (12);
+    // One row. Right side (right to left): presets, then auto gain.
+    saveButton.setBounds (top.removeFromRight (58).withSizeKeepingCentre (58, 28));
+    top.removeFromRight (6);
+    presetBox.setBounds (top.removeFromRight (200).withSizeKeepingCentre (200, 30));
+    capPreset = top.removeFromRight (58);
+    top.removeFromRight (14);
+    autoGainButton.setBounds (top.removeFromRight (90).withSizeKeepingCentre (90, 28));
+    capAutoGain = top.removeFromRight (80);
 
-    // Left side: name on top with the signal chain underneath
-    hdrTitle = header.removeFromTop (36);
-    hdrChain = header;
+    // Left side (left to right): input HPF, 5/6 order, timing + project tempo.
+    capHpf = top.removeFromLeft (70);
+    inHpfSlider.setBounds (top.removeFromLeft (170).withSizeKeepingCentre (170, 26));
+    top.removeFromLeft (12);
+    capSwap = top.removeFromLeft (80);
+    swapButton.setBounds (top.removeFromLeft (148).withSizeKeepingCentre (148, 28));
+    top.removeFromLeft (12);
+    capTiming = top.removeFromLeft (56);
+    timingBox.setBounds (top.removeFromLeft (100).withSizeKeepingCentre (100, 30));
+    top.removeFromLeft (6);
+    bpmLabel.setBounds (top.removeFromLeft (juce::jmin (130, top.getWidth())).withSizeKeepingCentre (juce::jmin (130, top.getWidth()), 28));
 
     r.removeFromBottom (8);
 

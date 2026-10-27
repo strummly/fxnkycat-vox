@@ -13,10 +13,14 @@ namespace ui
         explicit SpectrumAnalyzer (VocalChainProcessor& p);
         ~SpectrumAnalyzer() override { stopTimer(); }
         void paint (juce::Graphics&) override;
-        void setWatermark (juce::Image img) { watermark = std::move (img); repaint(); }
+        void setWatermark (juce::Image img, juce::String name)
+        {
+            watermark = std::move (img); watermarkText = std::move (name); repaint();
+        }
 
     private:
-        juce::Image watermark;   // faint logo behind the traces
+        juce::Image  watermark;       // faint logo behind the traces
+        juce::String watermarkText;   // plugin name, drawn beside the logo
         static constexpr int kOrder = 12, kSize = 1 << kOrder, kBins = kSize / 2;
         static constexpr float kMinDb = -96.0f, kMaxDb = 0.0f, kMinHz = 20.0f, kMaxHz = 20000.0f;
 
@@ -42,6 +46,15 @@ namespace ui
         Trace pre, post;
     };
 
+    // Knob drawing. A slider with the "fillRight" property set draws its gold arc from
+    // the pointer to the right-hand end instead of from the left-hand start (thresholds).
+    class KnobLookAndFeel : public juce::LookAndFeel_V4
+    {
+    public:
+        void drawRotarySlider (juce::Graphics&, int x, int y, int w, int h, float pos,
+                               float startAngle, float endAngle, juce::Slider&) override;
+    };
+
     // A two-state switch that shows different text for off / on (e.g. MALE / FEMALE).
     class SwitchButton : public juce::Button
     {
@@ -56,13 +69,17 @@ namespace ui
     class LabeledControl : public juce::Component
     {
     public:
-        LabeledControl (const juce::String& caption, std::unique_ptr<juce::Component> control, bool compact);
+        LabeledControl (const juce::String& caption, std::unique_ptr<juce::Component> control, bool compact,
+                        int compactMaxWidth = 130);
         void resized() override;
         juce::Component& get() { return *control; }
+        void setControlHeight (int h) { controlHeight = h; resized(); }   // compact only
     private:
         juce::Label label;
         std::unique_ptr<juce::Component> control;
         bool compact;
+        int  maxWidth;
+        int  controlHeight = 28;
     };
 
     // Multi-position switch (e.g. 1/8 | 1/4 | 1/2) bound to a choice parameter.
@@ -72,9 +89,13 @@ namespace ui
         explicit SegmentedSwitch (juce::AudioParameterChoice& param);
         void paint (juce::Graphics&) override;
         void mouseDown (const juce::MouseEvent&) override;
+        void setVertical (bool v) { vertical = v; repaint(); }   // options stacked top to bottom
+        void setReversed (bool r) { reversed = r; repaint(); }   // show the last option first
     private:
+        int slotFor (int option) const { return reversed ? options.size() - 1 - option : option; }
         juce::StringArray options;
         int selected = 0;
+        bool vertical = false, reversed = false;
         juce::ParameterAttachment attachment;
     };
 
@@ -87,12 +108,20 @@ namespace ui
         void paint (juce::Graphics&) override;
         void resized() override;
         void setActivity (float v);   // 0-1, drives the LED and meter bar
+        // Split the meter into two bars side by side: left = v2 (setActivity2), right = setActivity.
+        // ledBoth: the LED follows whichever bar is higher (otherwise only the right one).
+        void setSplitMeter (bool s, bool ledBoth = false) { splitMeter = s; ledFollowsBoth = ledBoth; repaint(); }
+        void setActivity2 (float v);
         void setNumber (const juce::String& n) { if (n != number) { number = n; repaint(); } }
+        // Switches stacked in a column on the left, the last control (a knob) on the right.
+        void setSideStack (bool s) { sideStack = s; resized(); }
         juce::ToggleButton enable;
     private:
+        bool sideStack = false;
         juce::Rectangle<float> ledArea() const;
         juce::Rectangle<float> meterArea() const;
-        float activity = 0.0f;
+        float activity = 0.0f, activity2 = 0.0f;
+        bool  splitMeter = false, ledFollowsBoth = false;
         juce::String number, title, subtitle;
         int rows;
         std::vector<std::unique_ptr<LabeledControl>> controls;
@@ -120,7 +149,8 @@ private:
     float shownActivity[VocalChainProcessor::kNumStages] {};
 
     VocalChainProcessor& proc;
-    juce::LookAndFeel_V4 lnf;
+    ui::KnobLookAndFeel lnf;
+    float shownActivity2[VocalChainProcessor::kNumStages] {};   // left-hand bars of split meters
 
     // Panels first so they are destroyed after the attachments below.
     ui::ModulePanel rider, comp1, problemEQ, deEsser, pultec, comp2, tape, delay, filters;
@@ -131,8 +161,17 @@ private:
     void applySwap (bool s);
     juce::Slider inHpfSlider { juce::Slider::LinearHorizontal, juce::Slider::TextBoxRight };   // input high-pass
 
+    ui::SwitchButton autoGainButton { "OFF", "ON" };              // output auto gain
+
+    // Presets: 10 user slots
+    juce::ComboBox   presetBox;
+    juce::TextButton saveButton { "SAVE" };
+    void refreshPresetList (int selectSlot = -1);
+    void presetChosen();
+    void showSaveDialog();
+
     // Top bar areas, set in resized() and drawn in paint()
-    juce::Rectangle<int> hdrTitle, hdrChain, capHpf, capSwap, capTiming;
+    juce::Rectangle<int> capHpf, capSwap, capTiming, capPreset, capAutoGain, hdrDivider;
     ui::SpectrumAnalyzer analyzer;
 
     std::vector<std::unique_ptr<APVTS::SliderAttachment>>   sliderAtts;

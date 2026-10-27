@@ -149,6 +149,7 @@ struct VolumeRider
 
     float ms = 0, gainDb = 0;
     float meter = 0;   // largest ride (dB, either direction) since last read
+    float overMeter = 0;   // most the level went over the threshold (dB) since last read
     float rmsC = 0, downC = 0, upC = 0, idleC = 0;
     double fs = 44100, lastBeat = -1;
 
@@ -187,6 +188,7 @@ struct VolumeRider
             float want = 0.0f;
             if (levelDb > threshDb)
             {
+                overMeter = std::max (overMeter, levelDb - threshDb);
                 want = std::clamp (targetDb - levelDb, -kMaxRangeDb, kMaxRangeDb);
                 c = want < gainDb ? downC : upC;
             }
@@ -394,7 +396,8 @@ struct ResonanceTracker
     float cutEnv = 0, cutAtt = 0, cutRel = 0;
     float curLogF = 0, targetLogF = 0, glide = 0;
     float prom = 0, promTarget = 0;
-    float meter = 0;   // deepest cut (dB) since last read
+    float meter = 0;      // deepest cut (dB) since last read
+    float detMeter = 0;   // most the tracked spot went over the threshold (dB) since last read
     double fs = 44100, cutQ = 4.0;
     int hop = 0;
     bool strongestMode = false;   // true: follow the loudest point, not the one that sticks out
@@ -514,6 +517,7 @@ struct ResonanceTracker
             const float standOut = std::clamp (prom / 6.0f, 0.0f, 1.0f);
             const float cutDb = std::min (maxCutDb, computeGR (gainToDb (cutEnv), threshDb, ratio, 4.0f)) * standOut;
             meter = std::max (meter, cutDb);
+            detMeter = std::max (detMeter, std::max (0.0f, gainToDb (cutEnv) - threshDb) * standOut);
             const float gm1 = dbToGain (-cutDb) - 1.0f;
 
             for (int c = 0; c < nch; ++c) ch[c][i] += gm1 * bp[c];
@@ -523,41 +527,44 @@ struct ResonanceTracker
 
 //==============================================================================
 // 3. Problem EQ: three resonance trackers, each searching its own range
-// (low mud, mid boxy/nasal ring, upper harshness). The male/female switch moves
-// the search ranges. The threshold slider is shared; the upper bands get an offset
-// because vocals naturally carry less energy up there.
+// (low mud, mid boxy/nasal ring, upper harshness). The vocal range switch moves
+// the search ranges to suit the singer. The threshold slider is shared; the upper
+// bands get an offset because vocals naturally carry less energy up there.
 struct ProblemEQ
 {
-    struct Region { double maleLo, maleHi, femLo, femHi, q; float threshOffset; };
-    static constexpr Region kRegions[3] = {
-        { 150.0,  400.0,  200.0,  500.0,  3.0,   0.0f },  // mud
-        { 400.0,  2000.0, 500.0,  2500.0, 4.5,  -6.0f },  // boxy / nasal resonance
-        { 2000.0, 5000.0, 2500.0, 6500.0, 4.0, -10.0f },  // harshness
+    // Search ranges (Hz) per vocal range: { mud lo/hi, mid lo/hi, high lo/hi }
+    struct Ranges { double lo[3], hi[3]; };
+    static constexpr int kNumRanges = 3;   // bass/baritone, tenor/alto, mezzo/soprano
+    static constexpr Ranges kRanges[kNumRanges] = {
+        { { 120.0, 350.0, 1800.0 }, { 400.0, 2000.0, 5000.0 } },   // bass / baritone
+        { { 170.0, 450.0, 2200.0 }, { 500.0, 2500.0, 6000.0 } },   // tenor / alto
+        { { 220.0, 550.0, 2700.0 }, { 650.0, 3000.0, 7000.0 } },   // mezzo / soprano
     };
-    static constexpr float kRatio = 3.0f, kMaxCutDb = 8.0f;
+    static constexpr double kQ[3]        = { 3.0, 4.5, 4.0 };
+    static constexpr float  kOffsetDb[3] = { 0.0f, -6.0f, -10.0f };
+    static constexpr float  kRatio = 3.0f, kMaxCutDb = 8.0f;
 
     ResonanceTracker trackers[3];
-    int voice = -1;  // 0 male, 1 female
+    int range = -1;
 
     void prepare (double fs)
     {
+        range = 1;   // tenor / alto until told otherwise
         for (int b = 0; b < 3; ++b)
-            trackers[b].prepare (fs, kRegions[b].maleLo, kRegions[b].maleHi, kRegions[b].q);
-        voice = 0;
+            trackers[b].prepare (fs, kRanges[range].lo[b], kRanges[range].hi[b], kQ[b]);
     }
 
-    void process (float* const* ch, int nch, int n, float threshDb, bool female)
+    void process (float* const* ch, int nch, int n, float threshDb, int vocalRange)
     {
-        const int v = female ? 1 : 0;
-        if (v != voice)
+        const int r = std::clamp (vocalRange, 0, kNumRanges - 1);
+        if (r != range)
         {
-            voice = v;
+            range = r;
             for (int b = 0; b < 3; ++b)
-                trackers[b].setRange (female ? kRegions[b].femLo : kRegions[b].maleLo,
-                                      female ? kRegions[b].femHi : kRegions[b].maleHi);
+                trackers[b].setRange (kRanges[r].lo[b], kRanges[r].hi[b]);
         }
         for (int b = 0; b < 3; ++b)
-            trackers[b].process (ch, nch, n, threshDb + kRegions[b].threshOffset, kRatio, kMaxCutDb);
+            trackers[b].process (ch, nch, n, threshDb + kOffsetDb[b], kRatio, kMaxCutDb);
     }
 
     // Deepest cut of any band since last call, then resets.
@@ -592,6 +599,7 @@ struct DeEsser
     }
 
     float takeMeter() { const float m = tracker.meter; tracker.meter = 0; return m; }
+    float takeDetectMeter() { const float m = tracker.detMeter; tracker.detMeter = 0; return m; }
 };
 
 //==============================================================================
@@ -640,6 +648,10 @@ struct PultecEQ
         highAtten.makeHighShelf (fs, af, 0.6, -highAttenAmt * 1.6);        // up to -16 dB
     }
 
+    // Energy of the input, and of what the low and high boost sections each add,
+    // summed since the last takeMeters() (for the stage's two meter bars).
+    double eIn = 0, eLowAdd = 0, eHighAdd = 0;
+
     void process (float* const* ch, int nch, int n)
     {
         for (int c = 0; c < nch; ++c)
@@ -648,13 +660,29 @@ struct PultecEQ
             for (int i = 0; i < n; ++i)
             {
                 float x = d[i];
-                x = lowBoost.process (x, c);
-                x = lowAtten.process (x, c);
-                x = highBoost.process (x, c);
-                x = highAtten.process (x, c);
+                eIn += (double) x * x;
+                const float lb = lowBoost.process (x, c);
+                eLowAdd += (double) (lb - x) * (lb - x);
+                x = lowAtten.process (lb, c);
+                const float hb = highBoost.process (x, c);
+                eHighAdd += (double) (hb - x) * (hb - x);
+                x = highAtten.process (hb, c);
                 d[i] = x;
             }
         }
+    }
+
+    // How much each boost changes the sound, in dB relative to the input
+    // (-inf if silent). Resets the sums.
+    void takeMeters (float& lowDb, float& highDb, int samples)
+    {
+        if (eIn / std::max (1, samples) < 1.0e-7) { lowDb = highDb = -200.0f; }   // near-silence
+        else
+        {
+            lowDb  = 10.0f * std::log10 ((float) (eLowAdd  / eIn) + 1.0e-12f);
+            highDb = 10.0f * std::log10 ((float) (eHighAdd / eIn) + 1.0e-12f);
+        }
+        eIn = eLowAdd = eHighAdd = 0;
     }
 };
 
@@ -674,7 +702,7 @@ struct TapeSaturation
     {
         fs = sampleRate;
         headBump.reset(); hfLoss.reset();
-        lastAmount = -1;
+        lastAmount = -1; lastWet = -1;
         dcR = 1.0f - (float) (2.0 * kPi * 10.0 / fs);   // 10 Hz DC blocker
         for (int c = 0; c < kMaxCh; ++c) dcX[c] = dcY[c] = 0;
     }
@@ -685,21 +713,33 @@ struct TapeSaturation
         return x >= 0.0f ? std::tanh (x) : std::tanh (x * 0.9f) / 0.9f * 0.95f;
     }
 
-    // amount: 0-100 %
-    void process (float* const* ch, int nch, int n, float amount)
+    // amount: 0-100 %.
+    // Normal: amount sets how hard the tape is driven.
+    // Overdrive: the tape is driven flat out (full saturation + 18 dB more drive, full
+    // head bump and roll-off) and amount becomes a dry/wet mix of that driven sound.
+    void process (float* const* ch, int nch, int n, float amount, bool overdrive)
     {
-        const float a = std::clamp (amount * 0.01f, 0.0f, 1.0f);
-        if (a <= 0.0f) return;
+        const float knob = std::clamp (amount * 0.01f, 0.0f, 1.0f);
+        if (knob <= 0.0f) { lastWet = 0.0f; return; }   // nothing to add (dry only)
 
-        if (a != lastAmount)
+        const float a      = overdrive ? 1.0f : knob;      // drive amount
+        const float wetMix = overdrive ? knob : 1.0f;
+        const float colour = a;                            // tone shaping amount
+        const float key = colour;
+        if (key != lastAmount)
         {
-            lastAmount = a;
-            headBump.makePeak (fs, 90.0, 0.9, 2.0 * a);           // up to +2 dB at 90 Hz
-            hfLoss.makeHighShelf (fs, 9000.0, 0.7, -4.0 * a);     // up to -4 dB above ~9 kHz
+            lastAmount = key;
+            headBump.makePeak (fs, 90.0, 0.9, 2.0 * colour);           // up to +2 dB at 90 Hz
+            hfLoss.makeHighShelf (fs, 9000.0, 0.7, -4.0 * colour);     // up to -4 dB above ~9 kHz
         }
 
-        const float drive = dbToGain (18.0f * a);                // up to +18 dB into the "tape"
-        const float comp  = 1.0f / shape (drive * 0.25f) * 0.25f; // keep level roughly constant
+        const float driveDb = 18.0f * a + (overdrive ? 18.0f : 0.0f);
+        const float drive = dbToGain (driveDb);                      // into the "tape"
+        const float comp  = 1.0f / shape (drive * 0.25f) * 0.25f;    // keep level roughly constant
+
+        // Glide the mix across the block so turning the knob doesn't click.
+        const float wet0 = lastWet < 0.0f ? wetMix : lastWet;
+        lastWet = wetMix;
 
         for (int c = 0; c < nch; ++c)
         {
@@ -713,15 +753,18 @@ struct TapeSaturation
                 const float y = x - dcX[c] + dcR * dcY[c];
                 dcX[c] = x; dcY[c] = y;
                 x = hfLoss.process (y, c);
-                d[i] = x;
+                const float w = wet0 + (wetMix - wet0) * (float) (i + 1) / (float) n;
+                d[i] = dry + (x - dry) * w;
             }
         }
     }
+
+    float lastWet = -1.0f;
 };
 
 //==============================================================================
-// 7. Tempo delay, fixed 1/8 note. Repeats are filtered (150 Hz - 6 kHz) so they
-// sit behind the vocal. 'amount' is the level of the repeats added to the dry signal.
+// Tempo delay. Repeats are filtered (150 Hz - 6 kHz) so they sit behind the vocal
+// and run at full level; 'mix' crossfades dry -> wet (equal-power, 0 = dry only).
 struct TempoDelay
 {
     static constexpr float  kFeedback   = 0.35f;
@@ -746,10 +789,14 @@ struct TempoDelay
         for (int c = 0; c < kMaxCh; ++c) lp[c] = hp[c] = 0;
     }
 
-    void process (float* const* ch, int nch, int n, float delaySeconds, float amount)
+    void process (float* const* ch, int nch, int n, float delaySeconds, float mix)
     {
         const float target = std::clamp ((float) (delaySeconds * fs), 1.0f, (float) size - 4.0f);
         if (curDelay < 0) curDelay = target;
+
+        const float m      = std::clamp (mix, 0.0f, 1.0f);
+        const float dryG   = (float) std::cos (m * kPi * 0.5);
+        const float wetG   = (float) std::sin (m * kPi * 0.5);
 
         for (int i = 0; i < n; ++i)
         {
@@ -772,7 +819,7 @@ struct TempoDelay
 
                 const float x = ch[c][i];
                 b[(size_t) writePos] = x + wet * kFeedback;
-                ch[c][i] = x + wet * amount;
+                ch[c][i] = x * dryG + wet * wetG;
             }
             writePos = (writePos + 1) % size;
         }

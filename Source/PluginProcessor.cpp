@@ -56,6 +56,9 @@ APVTS::ParameterLayout VocalChainProcessor::createLayout()
                 .withValueFromStringFunction ([] (const juce::String& s) { return s.trim().equalsIgnoreCase ("off") ? 20.0f : s.getFloatValue(); })));
     }
 
+    // Output auto gain: keeps the output about as loud as the input
+    l.add (bparam ("autoGain", "Auto Gain", false));
+
     // Global timing note value. Tempo itself comes from the project (host).
     l.add (cparam ("division", "Timing", divisionNames(), 6));   // default 1/4
 
@@ -71,12 +74,13 @@ APVTS::ParameterLayout VocalChainProcessor::createLayout()
     // 3. Problem-frequency EQ
     l.add (bparam ("deqOn", "Problem EQ On", false));
     l.add (fparam ("deqThresh", "Problem EQ Threshold", -60.0f, 0.0f, 0.0f, "dB"));
-    l.add (bparam ("deqFemale", "Problem EQ Female", false));
+    l.add (cparam ("deqRange", "Problem EQ Vocal Range",
+                   { "Bass/Baritone", "Tenor/Alto", "Mezzo/Soprano" }, 1));   // default Tenor/Alto
 
     // 4. De-esser
     l.add (bparam ("deessOn", "De-esser On", false));
-    l.add (fparam ("deessSens", "De-esser Detection", 0.0f, 100.0f, 50.0f, "%", 1.0f));
-    l.add (fparam ("deessReduce", "De-esser Reduction", 0.0f, 20.0f, 6.0f, "dB"));
+    l.add (fparam ("deessSens", "De-esser Detection", 0.0f, 100.0f, 0.0f, "%", 1.0f));
+    l.add (fparam ("deessReduce", "De-esser Reduction", 0.0f, 20.0f, 0.0f, "dB"));
 
     // 5. Pultec EQP-1A style
     l.add (bparam ("pultecOn", "Pultec On", false));
@@ -97,16 +101,17 @@ APVTS::ParameterLayout VocalChainProcessor::createLayout()
     l.add (bparam ("comp2On", "Compressor On", false));
     l.add (bparam ("comp2Ratio4", "Compressor 4:1", false));
     l.add (fparam ("comp2Thresh", "Compressor Threshold", -40.0f, 0.0f, 0.0f, "dB"));
-    l.add (fparam ("comp2Makeup", "Compressor Makeup", 0.0f, 24.0f, 3.0f, "dB"));
+    l.add (bparam ("comp2SlowRel", "Compressor Slow Release", false));   // makeup gain is automatic
 
-    // Tape saturation (between 6 and 7)
+    // 7. Tape saturation
     l.add (bparam ("tapeOn", "Tape On", false));
-    l.add (fparam ("tapeAmount", "Tape Saturation", 0.0f, 100.0f, 20.0f, "%", 1.0f));
+    l.add (fparam ("tapeAmount", "Tape Saturation", 0.0f, 100.0f, 0.0f, "%", 1.0f));
+    l.add (bparam ("tapeOD", "Tape Overdrive", false));
 
-    // 7. Delay (1/8 note)
+    // 8. Delay: echoes at full level, knob is the dry/wet mix
     l.add (bparam ("delayOn", "Delay On", false));
     l.add (cparam ("delayDiv", "Delay Time", { "1/8", "1/4", "1/2" }, 0));
-    l.add (fparam ("delayAmount", "Delay Amount", 0.0f, 100.0f, 20.0f, "%", 1.0f));
+    l.add (fparam ("delayMix", "Delay Mix", 0.0f, 100.0f, 0.0f, "%", 1.0f));
 
     // 9. High / low pass (log-scaled knobs)
     auto freqParam = [] (const char* id, const char* name, float lo, float hi, float def)
@@ -117,8 +122,8 @@ APVTS::ParameterLayout VocalChainProcessor::createLayout()
                                                             juce::AudioParameterFloatAttributes().withLabel ("Hz"));
     };
     l.add (bparam ("filterOn", "Filter On", false));
-    l.add (freqParam ("hpFreq", "High Pass", 20.0f, 1000.0f, 80.0f));
-    l.add (freqParam ("lpFreq", "Low Pass", 2000.0f, 20000.0f, 18000.0f));
+    l.add (freqParam ("hpFreq", "High Pass", 20.0f, 1000.0f, 20.0f));
+    l.add (freqParam ("lpFreq", "Low Pass", 2000.0f, 20000.0f, 20000.0f));
 
     return l;
 }
@@ -134,7 +139,7 @@ VocalChainProcessor::VocalChainProcessor()
 
     riderThresh = p ("riderThresh"); riderTarget = p ("riderTarget");
     comp1Thresh = p ("comp1Thresh");
-    deqThresh   = p ("deqThresh");   deqFemale   = p ("deqFemale");
+    deqThresh   = p ("deqThresh");   deqRange    = p ("deqRange");   autoGain = p ("autoGain");
     swap56      = p ("swap56");      inHpf       = p ("inHpf");
     deessSens   = p ("deessSens"); deessReduce = p ("deessReduce");
 
@@ -142,9 +147,9 @@ VocalChainProcessor::VocalChainProcessor()
     pHighFreq  = p ("pHighFreq");  pHighBoost = p ("pHighBoost"); pBandwidth   = p ("pBandwidth");
     pHighAttFreq = p ("pHighAttFreq"); pHighAtten = p ("pHighAtten");
 
-    comp2Ratio4 = p ("comp2Ratio4"); comp2Thresh = p ("comp2Thresh"); comp2Makeup = p ("comp2Makeup");
-    division    = p ("division");    delayAmount = p ("delayAmount"); delayDiv = p ("delayDiv");
-    tapeOn      = p ("tapeOn");      tapeAmount  = p ("tapeAmount");
+    comp2Ratio4 = p ("comp2Ratio4"); comp2Thresh = p ("comp2Thresh"); comp2SlowRel = p ("comp2SlowRel");
+    division    = p ("division");    delayMix    = p ("delayMix");    delayDiv = p ("delayDiv");
+    tapeOn      = p ("tapeOn");      tapeAmount  = p ("tapeAmount");  tapeOD   = p ("tapeOD");
     filterOn    = p ("filterOn");    hpFreq      = p ("hpFreq");     lpFreq = p ("lpFreq");
 }
 
@@ -160,6 +165,8 @@ void VocalChainProcessor::prepareToPlay (double sr, int)
 {
     rider.prepare (sr);
     inputHpf.prepare (sr);
+    currentRate = sr;
+    agIn = agOut = 0.0f; agGainDb = 0.0f;
     compGate.prepare (sr);                   // de-ess + gate, fixed times
     problemEQ.prepare (sr);
     deEsser.prepare (sr);
@@ -208,10 +215,21 @@ void VocalChainProcessor::processBlock (juce::AudioBuffer<float>& buffer, juce::
     const float delaySec = (float) (kDelayBeats[juce::jlimit (0, 2, (int) delayDiv->load())] * quarter);
 
     rider.setTiming (unit);
-    comp2.setRelease (unit * 0.25);              // fast part of auto release: 1/4 of the Timing note
-    comp2.setSlowTimes (unit * 0.5, unit * 2.0); // slow part: builds over 1/2, lets go over 2x the Timing note
 
-    float stageAct[kNumStages] {};
+    // Compressor release: Fast (default) or Slow (4x longer), both program-dependent.
+    const double relScale = on (comp2SlowRel) ? 4.0 : 1.0;
+    comp2.setRelease (unit * 0.25 * relScale);              // fast part of the auto release
+    comp2.setSlowTimes (unit * 0.5, unit * 2.0 * relScale); // slow part: builds over 1/2, lets go over 2x
+
+    // Compressor auto makeup: half the gain reduction a full-scale signal would get.
+    const float c2Thresh = comp2Thresh->load();
+    const float c2Ratio  = on (comp2Ratio4) ? 4.0f : 3.0f;
+    const float c2Makeup = 0.5f * -c2Thresh * (1.0f - 1.0f / c2Ratio);
+
+    float stageAct[kNumStages] {}, stageAct2[kNumStages] {};
+
+    // Change in dB (relative to the input) -> 0-1, same scale as the static stages.
+    auto changeAct = [] (float changeDb) { return juce::jlimit (0.0f, 1.0f, juce::jmap (changeDb, -40.0f, -10.0f, 0.0f, 1.0f)); };
 
     // Dynamic stages report how many dB they are moving the level; 6 dB = fully lit.
     auto dynAct = [] (float& meter) { const float v = juce::jlimit (0.0f, 1.0f, meter / 6.0f); meter = 0; return v; };
@@ -245,6 +263,15 @@ void VocalChainProcessor::processBlock (juce::AudioBuffer<float>& buffer, juce::
 
         preTap.push (ch, nch, len);   // "before" for the analyzer (raw input)
 
+        auto meanSquare = [&]
+        {
+            double e = 0;
+            for (int c = 0; c < nch; ++c)
+                for (int i = 0; i < len; ++i) e += ch[c][i] * ch[c][i];
+            return (float) (e / (double) (len * nch));
+        };
+        const float inMs = meanSquare();   // for auto gain
+
         // Input high-pass, ahead of stage 1
         if (const float hz = inHpf->load(); hz > kInHpfOffHz)
             inputHpf.process (ch, nch, len, hz);
@@ -254,6 +281,9 @@ void VocalChainProcessor::processBlock (juce::AudioBuffer<float>& buffer, juce::
         {
             rider.process (ch, nch, len, riderThresh->load(), riderTarget->load());
             stageAct[0] = juce::jmax (stageAct[0], dynAct (rider.meter));
+            // Left bar: how far the level goes over the threshold, full at 12 dB
+            stageAct2[0] = juce::jmax (stageAct2[0], juce::jlimit (0.0f, 1.0f, rider.overMeter / 12.0f));
+            rider.overMeter = 0;
         }
 
         // 2. Light compressor
@@ -266,7 +296,7 @@ void VocalChainProcessor::processBlock (juce::AudioBuffer<float>& buffer, juce::
         // 3. Problem-frequency EQ
         if (on (deqOn))
         {
-            problemEQ.process (ch, nch, len, deqThresh->load(), on (deqFemale));
+            problemEQ.process (ch, nch, len, deqThresh->load(), (int) deqRange->load());
             float m = problemEQ.takeMeter();
             stageAct[2] = juce::jmax (stageAct[2], dynAct (m));
         }
@@ -277,6 +307,8 @@ void VocalChainProcessor::processBlock (juce::AudioBuffer<float>& buffer, juce::
             deEsser.process (ch, nch, len, deessSens->load(), deessReduce->load());
             float m = deEsser.takeMeter();
             stageAct[3] = juce::jmax (stageAct[3], dynAct (m));
+            // Detection: how far the s/sh goes over the threshold, full scale at 12 dB.
+            stageAct2[3] = juce::jmax (stageAct2[3], juce::jlimit (0.0f, 1.0f, deEsser.takeDetectMeter() / 12.0f));
         }
 
         // 5. Pultec
@@ -286,15 +318,19 @@ void VocalChainProcessor::processBlock (juce::AudioBuffer<float>& buffer, juce::
             pultec.update ((int) pLowFreq->load(), pLowBoost->load(), pLowAtten->load(),
                            (int) pHighFreq->load(), pHighBoost->load(), pBandwidth->load(),
                            (int) pHighAttFreq->load(), pHighAtten->load());
-            runStatic (4, ch, nch, len, [&] { pultec.process (ch, nch, len); });
+            pultec.process (ch, nch, len);
+            // Two bars: left = low boost, right = high boost
+            float lowDb, highDb;
+            pultec.takeMeters (lowDb, highDb, len * nch);
+            stageAct2[4] = juce::jmax (stageAct2[4], changeAct (lowDb));
+            stageAct[4]  = juce::jmax (stageAct[4],  changeAct (highDb));
         };
 
         // 6. Compressor (meter shows gain reduction, not makeup)
         auto runComp2 = [&]
         {
             if (! on (comp2On)) return;
-            comp2.process (ch, nch, len, comp2Thresh->load(), on (comp2Ratio4) ? 4.0f : 3.0f,
-                           comp2Makeup->load(), true);
+            comp2.process (ch, nch, len, c2Thresh, c2Ratio, c2Makeup, true);
             stageAct[5] = juce::jmax (stageAct[5], dynAct (comp2.meter));
         };
 
@@ -304,15 +340,39 @@ void VocalChainProcessor::processBlock (juce::AudioBuffer<float>& buffer, juce::
 
         // 7. Tape saturation
         if (on (tapeOn))
-            runStatic (6, ch, nch, len, [&] { tape.process (ch, nch, len, tapeAmount->load()); });
+            runStatic (6, ch, nch, len, [&] { tape.process (ch, nch, len, tapeAmount->load(), on (tapeOD)); });
 
         // 8. Delay
         if (on (delayOn))
-            runStatic (7, ch, nch, len, [&] { delay.process (ch, nch, len, delaySec, delayAmount->load() * 0.01f); });
+            runStatic (7, ch, nch, len, [&] { delay.process (ch, nch, len, delaySec, delayMix->load() * 0.01f); });
 
         // 9. High / low pass
         if (on (filterOn))
             runStatic (8, ch, nch, len, [&] { passFilters.process (ch, nch, len, hpFreq->load(), lpFreq->load()); });
+
+        // Auto gain: follow input and output loudness (~1 s average) and trim the
+        // output so it matches the input, within +/-18 dB. Holds during silence.
+        {
+            const float outMs = meanSquare();
+            const float c = (float) std::exp (-(double) len / (1.0 * currentRate));
+            agIn  = c * agIn  + (1.0f - c) * inMs;
+            agOut = c * agOut + (1.0f - c) * outMs;
+
+            float target = agGainDb;
+            if (! on (autoGain))
+                target = 0.0f;
+            else if (agIn > 1.0e-7f && agOut > 1.0e-9f)   // ignore near-silence
+                target = juce::jlimit (-18.0f, 18.0f, 10.0f * std::log10 (agIn / agOut));
+
+            const float gc = (float) std::exp (-(double) len / (0.3 * currentRate));
+            const float newDb = gc * agGainDb + (1.0f - gc) * target;
+            const float g0 = juce::Decibels::decibelsToGain (agGainDb), g1 = juce::Decibels::decibelsToGain (newDb);
+            agGainDb = newDb;
+            if (std::abs (g1 - 1.0f) > 1.0e-5f || std::abs (g0 - 1.0f) > 1.0e-5f)
+                for (int cc = 0; cc < nch; ++cc)
+                    for (int i = 0; i < len; ++i)
+                        ch[cc][i] *= g0 + (g1 - g0) * (float) (i + 1) / (float) len;
+        }
 
         postTap.push (ch, nch, len);  // "after" for the analyzer
     }
@@ -322,7 +382,54 @@ void VocalChainProcessor::processBlock (juce::AudioBuffer<float>& buffer, juce::
     {
         float prev = activity[s].load();
         while (stageAct[s] > prev && ! activity[s].compare_exchange_weak (prev, stageAct[s])) {}
+        float prev2 = activity2[s].load();
+        while (stageAct2[s] > prev2 && ! activity2[s].compare_exchange_weak (prev2, stageAct2[s])) {}
     }
+}
+
+//==============================================================================
+// Presets
+juce::File VocalChainProcessor::presetFolder()
+{
+    auto dir = juce::File::getSpecialLocation (juce::File::userApplicationDataDirectory);
+   #if JUCE_MAC
+    dir = dir.getChildFile ("Application Support");
+   #endif
+    return dir.getChildFile ("fxnkycat vox").getChildFile ("Presets");
+}
+
+juce::File VocalChainProcessor::presetFile (int slot)
+{
+    return presetFolder().getChildFile ("Preset " + juce::String (slot + 1).paddedLeft ('0', 2) + ".xml");
+}
+
+juce::String VocalChainProcessor::presetName (int slot) const
+{
+    const auto f = presetFile (slot);
+    if (! f.existsAsFile()) return {};
+    if (auto xml = juce::XmlDocument::parse (f))
+        return xml->getStringAttribute ("presetName", "Preset " + juce::String (slot + 1));
+    return {};
+}
+
+bool VocalChainProcessor::savePreset (int slot, const juce::String& name)
+{
+    if (slot < 0 || slot >= kNumPresets) return false;
+    auto xml = apvts.copyState().createXml();
+    if (xml == nullptr) return false;
+    xml->setAttribute ("presetName", name.trim().isEmpty() ? "Preset " + juce::String (slot + 1) : name.trim());
+    presetFolder().createDirectory();
+    return xml->writeTo (presetFile (slot));
+}
+
+bool VocalChainProcessor::loadPreset (int slot)
+{
+    if (slot < 0 || slot >= kNumPresets) return false;
+    auto xml = juce::XmlDocument::parse (presetFile (slot));
+    if (xml == nullptr || ! xml->hasTagName (apvts.state.getType())) return false;
+    xml->removeAttribute ("presetName");
+    apvts.replaceState (juce::ValueTree::fromXml (*xml));
+    return true;
 }
 
 juce::AudioProcessorEditor* VocalChainProcessor::createEditor()

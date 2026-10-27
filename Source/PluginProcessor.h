@@ -45,6 +45,9 @@ public:
     // Order: rider, light comp, problem EQ, de-esser, pultec, compressor, tape, delay, filters.
     static constexpr int kNumStages = 9;
     std::atomic<float> activity[kNumStages] {};
+    // Second (left-hand) meter for stages with split meters, 0-1:
+    // rider = level over threshold, de-esser = detection, Pultec = low boost.
+    std::atomic<float> activity2[kNumStages] {};
 
     VocalChainProcessor();
     ~VocalChainProcessor() override = default;
@@ -75,6 +78,14 @@ public:
     static juce::AudioProcessorValueTreeState::ParameterLayout createLayout();
     static juce::StringArray divisionNames();
 
+    // User presets: 10 slots saved as XML files shared by every project/DAW.
+    static constexpr int kNumPresets = 10;
+    static juce::File presetFolder();
+    static juce::File presetFile (int slot);          // slot 0-9
+    juce::String presetName (int slot) const;         // empty if the slot is unused
+    bool savePreset (int slot, const juce::String& name);
+    bool loadPreset (int slot);
+
     std::atomic<float> hostBpm { 120.0f };   // project tempo, for display
     static constexpr float kInHpfOffHz = 20.5f;  // input high-pass at/below this = Off
     juce::AudioProcessorValueTreeState apvts;
@@ -89,21 +100,25 @@ private:
     // 2 Light compressor
     std::atomic<float> *comp1Thresh;
     // 3 Problem EQ
-    std::atomic<float> *deqThresh, *deqFemale;
+    std::atomic<float> *deqThresh, *deqRange;
     // 4 De-esser
     std::atomic<float> *deessSens, *deessReduce;
-    std::atomic<float> *swap56, *inHpf;
+    std::atomic<float> *swap56, *inHpf, *autoGain;
     // 5 Pultec
     std::atomic<float> *pLowFreq, *pLowBoost, *pLowAtten, *pHighFreq, *pHighBoost,
                        *pBandwidth, *pHighAttFreq, *pHighAtten;
     // 6 Compressor
-    std::atomic<float> *comp2Ratio4, *comp2Thresh, *comp2Makeup;
+    std::atomic<float> *comp2Ratio4, *comp2Thresh, *comp2SlowRel;
     // Global tempo + 7 Delay
-    std::atomic<float> *division, *delayAmount, *delayDiv;
+    std::atomic<float> *division, *delayMix, *delayDiv;
     // Tape
-    std::atomic<float> *tapeOn, *tapeAmount;
+    std::atomic<float> *tapeOn, *tapeAmount, *tapeOD;
     // 9 High / low pass
     std::atomic<float> *filterOn, *hpFreq, *lpFreq;
+
+    // Auto gain state (audio thread only)
+    double currentRate = 44100.0;
+    float  agIn = 0.0f, agOut = 0.0f, agGainDb = 0.0f;
 
     static constexpr int kChunk = 512;
     std::array<std::array<float, kChunk>, vc::kMaxCh> stageIn {};
