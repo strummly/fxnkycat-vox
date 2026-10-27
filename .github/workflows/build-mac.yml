@@ -10,7 +10,7 @@ on:
 
 jobs:
   mac:
-    runs-on: macos-14
+    runs-on: macos-15
     env:
       ART: build/VocalChain_artefacts/Release
     steps:
