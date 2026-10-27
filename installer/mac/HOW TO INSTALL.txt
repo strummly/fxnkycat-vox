@@ -1,0 +1,28 @@
+fxnkycat vox - vocal chain plugin for Mac
+Runs on Apple Silicon and Intel Macs, macOS 10.13 or newer.
+
+WHICH FILE DO I NEED?
+  fxnkycat vox.component  -> Logic Pro, GarageBand (Audio Unit)
+  fxnkycat vox.vst3       -> Ableton Live, FL Studio, Reaper, Cubase, Studio One, Bitwig...
+Installing both is fine.
+
+INSTALL
+1. Quit your DAW.
+2. In Finder, choose Go > Go to Folder... and paste:
+       ~/Library/Audio/Plug-Ins/
+3. Copy  "fxnkycat vox.component"  into the  Components  folder.
+   Copy  "fxnkycat vox.vst3"       into the  VST3        folder.
+   (Create the folder if it isn't there.)
+
+4. IMPORTANT - unblock the plugin (it isn't signed by Apple yet, so macOS
+   blocks it on first use). Open Terminal and paste these two lines:
+
+   xattr -dr com.apple.quarantine ~/Library/Audio/Plug-Ins/Components/"fxnkycat vox.component"
+   xattr -dr com.apple.quarantine ~/Library/Audio/Plug-Ins/VST3/"fxnkycat vox.vst3"
+
+5. Open your DAW and rescan plugins.
+   Logic Pro: Logic Pro > Settings > Plug-in Manager > "Reset & Rescan Selection"
+   if it shows as failed or doesn't appear.
+
+Look for "fxnkycat vox" by "fxnkycat".
+Every stage starts OFF - switch on the ones you want. Tempo follows your project.
