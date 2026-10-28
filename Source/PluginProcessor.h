@@ -42,8 +42,8 @@ public:
     AnalyzerTap preTap, postTap;   // input and output of the whole chain
 
     // How hard each stage is working right now, 0-1 (peak since the editor last read it).
-    // Order: rider, light comp, problem EQ, de-esser, pultec, compressor, tape, delay, filters.
-    static constexpr int kNumStages = 9;
+    // Order: rider, comp-gate, problem EQ, warmth/air, de-esser, pultec, compressor, tape, delay, reverb, filters.
+    static constexpr int kNumStages = 11;
     std::atomic<float> activity[kNumStages] {};
     // Second (left-hand) meter for stages with split meters, 0-1:
     // rider = level over threshold, de-esser = detection, Pultec = low boost.
@@ -64,13 +64,16 @@ public:
     bool acceptsMidi() const override  { return false; }
     bool producesMidi() const override { return false; }
     bool isMidiEffect() const override { return false; }
-    double getTailLengthSeconds() const override { return 2.0; }
+    double getTailLengthSeconds() const override { return 4.0; }   // delay + reverb tails
 
     int getNumPrograms() override { return 1; }
     int getCurrentProgram() override { return 0; }
     void setCurrentProgram (int) override {}
     const juce::String getProgramName (int) override { return {}; }
     void changeProgramName (int, const juce::String&) override {}
+
+    // The top-bar BYPASS button is also the DAW's own bypass for this plugin.
+    juce::AudioProcessorParameter* getBypassParameter() const override { return bypassParam; }
 
     void getStateInformation (juce::MemoryBlock& destData) override;
     void setStateInformation (const void* data, int sizeInBytes) override;
@@ -96,13 +99,13 @@ private:
     // Stage on/off
     std::atomic<float> *riderOn, *comp1On, *deqOn, *deessOn, *pultecOn, *comp2On, *delayOn;
     // 1 Rider
-    std::atomic<float> *riderThresh, *riderTarget;
+    std::atomic<float> *riderThresh, *riderTarget, *riderMode;
     // 2 Light compressor
     std::atomic<float> *comp1Thresh;
     // 3 Problem EQ
     std::atomic<float> *deqThresh, *deqRange;
     // 4 De-esser
-    std::atomic<float> *deessSens, *deessReduce;
+    std::atomic<float> *deessSens, *deessReduce, *deessSolo;
     std::atomic<float> *swap56, *inHpf, *autoGain;
     // 5 Pultec
     std::atomic<float> *pLowFreq, *pLowBoost, *pLowAtten, *pHighFreq, *pHighBoost,
@@ -115,6 +118,15 @@ private:
     std::atomic<float> *tapeOn, *tapeAmount, *tapeOD;
     // 9 High / low pass
     std::atomic<float> *filterOn, *hpFreq, *lpFreq;
+    // 9 Reverb + background light compressor
+    std::atomic<float> *reverbOn, *revType, *revMix, *lightCompOn;
+    // 4 Warmth & Air
+    std::atomic<float> *colorOn, *warmth, *air;
+
+    // Bypass
+    juce::AudioParameterBool* bypassParam = nullptr;
+    bool wasBypassed = false;
+    juce::AudioBuffer<float> dryBuf;   // copy of the input for the bypass crossfade
 
     // Auto gain state (audio thread only)
     double currentRate = 44100.0;
@@ -133,6 +145,9 @@ private:
     vc::TapeSaturation tape;
     vc::TempoDelay  delay;
     vc::PassFilters passFilters;
+    vc::DuckingReverb reverb;
+    vc::LightComp   lightComp;
+    vc::WarmthAir   warmthAir;
 
     JUCE_DECLARE_NON_COPYABLE_WITH_LEAK_DETECTOR (VocalChainProcessor)
 };

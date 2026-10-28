@@ -20,10 +20,44 @@ SwitchButton::SwitchButton (juce::String offText, juce::String onText)
     setClickingTogglesState (true);
 }
 
+bool SwitchButton::onSelectedSide (const juce::MouseEvent& e) const
+{
+    const bool leftHalf = e.x < getWidth() / 2;
+    const bool onSide   = onLeft ? leftHalf : ! leftHalf;   // the half that means "on"
+    return onSide == getToggleState();
+}
+
+void SwitchButton::mouseDown (const juce::MouseEvent& e)
+{
+    // Text-only: clicking the word that is already selected does nothing.
+    ignoreClick = textOnly && onSelectedSide (e);
+    if (! ignoreClick) juce::Button::mouseDown (e);
+}
+
+void SwitchButton::mouseUp (const juce::MouseEvent& e)
+{
+    if (! ignoreClick) juce::Button::mouseUp (e);
+    ignoreClick = false;
+}
+
 void SwitchButton::paintButton (juce::Graphics& g, bool highlighted, bool)
 {
     auto r = getLocalBounds().toFloat().reduced (1.0f);
     const bool state = getToggleState();
+
+    if (textOnly)
+    {
+        // Just the two words: gold = selected, grey = not (like the stage names).
+        auto left = r.removeFromLeft (r.getWidth() * 0.5f);
+        const auto offArea = onLeft ? r : left, onArea = onLeft ? left : r;
+        g.setFont (juce::FontOptions (13.0f, juce::Font::bold));
+        auto col = [&] (bool sel) { return sel ? accent : (highlighted ? dimText.brighter (0.3f) : dimText); };
+        g.setColour (col (! state));
+        g.drawFittedText (off, offArea.toNearestInt(), juce::Justification::centred, 1);
+        g.setColour (col (state));
+        g.drawFittedText (on, onArea.toNearestInt(), juce::Justification::centred, 1);
+        return;
+    }
 
     g.setColour (highlighted ? edge.brighter (0.2f) : edge);
     g.fillRoundedRectangle (r, 5.0f);
@@ -31,14 +65,15 @@ void SwitchButton::paintButton (juce::Graphics& g, bool highlighted, bool)
     // Two halves; the active one is lit.
     auto left = r.removeFromLeft (r.getWidth() * 0.5f);
     auto right = r;
+    const auto offArea = onLeft ? right : left, onArea = onLeft ? left : right;
     g.setColour (accent);
-    g.fillRoundedRectangle ((state ? right : left).reduced (2.0f), 4.0f);
+    g.fillRoundedRectangle ((state ? onArea : offArea).reduced (2.0f), 4.0f);
 
     g.setFont (juce::FontOptions (12.0f, juce::Font::bold));
     g.setColour (state ? dimText : bg);
-    g.drawFittedText (off, left.toNearestInt(), juce::Justification::centred, 1);
+    g.drawFittedText (off, offArea.toNearestInt(), juce::Justification::centred, 1);
     g.setColour (state ? bg : dimText);
-    g.drawFittedText (on, right.toNearestInt(), juce::Justification::centred, 1);
+    g.drawFittedText (on, onArea.toNearestInt(), juce::Justification::centred, 1);
 }
 
 //------------------------------------------------------------------------------
@@ -114,11 +149,26 @@ SegmentedSwitch::SegmentedSwitch (juce::AudioParameterChoice& p)
 void SegmentedSwitch::paint (juce::Graphics& g)
 {
     auto r = getLocalBounds().toFloat().reduced (1.0f);
-    g.setColour (edge);
-    g.fillRoundedRectangle (r, 5.0f);
-
     const int n = juce::jmax (1, options.size());
     const float w = r.getWidth() / (float) n, h = r.getHeight() / (float) n;
+
+    if (textOnly)
+    {
+        // Just the words: gold = selected, grey = not (like the stage names). Hovered word brightens.
+        g.setFont (juce::FontOptions (13.0f, juce::Font::bold));
+        for (int i = 0; i < n; ++i)
+        {
+            const int s = slotFor (i);
+            auto seg = vertical ? juce::Rectangle<float> (r.getX(), r.getY() + h * (float) s, r.getWidth(), h)
+                                : juce::Rectangle<float> (r.getX() + w * (float) s, r.getY(), w, r.getHeight());
+            g.setColour (i == selected ? accent : (s == hoverSlot ? dimText.brighter (0.3f) : dimText));
+            g.drawFittedText (options[i], seg.toNearestInt(), juce::Justification::centred, 1);
+        }
+        return;
+    }
+
+    g.setColour (edge);
+    g.fillRoundedRectangle (r, 5.0f);
     g.setFont (juce::FontOptions (12.0f, juce::Font::bold));
     for (int i = 0; i < n; ++i)
     {
@@ -141,6 +191,20 @@ void SegmentedSwitch::mouseDown (const juce::MouseEvent& e)
     const float pos = vertical ? (float) e.y / (float) getHeight() : (float) e.x / (float) getWidth();
     const int idx = slotFor (juce::jlimit (0, n - 1, (int) (pos * (float) n)));
     attachment.setValueAsCompleteGesture ((float) idx);
+}
+
+void SegmentedSwitch::mouseMove (const juce::MouseEvent& e)
+{
+    if (! textOnly) return;
+    const int n = juce::jmax (1, options.size());
+    const float pos = vertical ? (float) e.y / (float) getHeight() : (float) e.x / (float) getWidth();
+    const int s = juce::jlimit (0, n - 1, (int) (pos * (float) n));
+    if (s != hoverSlot) { hoverSlot = s; repaint(); }
+}
+
+void SegmentedSwitch::mouseExit (const juce::MouseEvent&)
+{
+    if (hoverSlot != -1) { hoverSlot = -1; repaint(); }
 }
 
 //------------------------------------------------------------------------------
@@ -350,26 +414,66 @@ void SpectrumAnalyzer::paint (juce::Graphics& g)
 }
 
 //------------------------------------------------------------------------------
+LedButton::LedButton() : juce::Button ({})
+{
+    setClickingTogglesState (true);
+    setMouseCursor (juce::MouseCursor::PointingHandCursor);
+}
+
+void LedButton::paintButton (juce::Graphics& g, bool highlighted, bool)
+{
+    const float d = juce::jmin (16.0f, (float) juce::jmin (getWidth(), getHeight()) - 8.0f);
+    const auto led = getLocalBounds().toFloat().withSizeKeepingCentre (d, d);
+    const juce::Colour hot { 0xffff7a3d };
+    if (getToggleState())
+    {
+        g.setColour (hot.withAlpha (0.35f));
+        g.fillEllipse (led.expanded (4.0f));   // glow
+        g.setColour (hot);
+    }
+    else
+        g.setColour (highlighted ? edge.brighter (0.3f) : edge);
+    g.fillEllipse (led);
+    g.setColour (bg.withAlpha (0.6f));
+    g.drawEllipse (led, 1.0f);
+}
+
+TitleToggle::TitleToggle() : juce::Button ({})
+{
+    setClickingTogglesState (true);
+    setMouseCursor (juce::MouseCursor::PointingHandCursor);
+}
+
+juce::Font TitleToggle::font() { return juce::Font (juce::FontOptions (15.0f, juce::Font::bold)); }
+
+void TitleToggle::paintButton (juce::Graphics& g, bool highlighted, bool)
+{
+    auto c = getToggleState() ? accent : dimText;
+    if (highlighted) c = c.brighter (0.25f);
+    g.setColour (c);
+    g.setFont (font());
+    g.drawText (getButtonText(), getLocalBounds(), juce::Justification::topLeft, true);
+}
+
 ModulePanel::ModulePanel (juce::String num, juce::String t, juce::String sub, int r)
     : number (std::move (num)), title (std::move (t)), subtitle (std::move (sub)), rows (r)
 {
-    enable.setButtonText ("ON");
-    enable.setColour (juce::ToggleButton::tickColourId, accent);
-    enable.setColour (juce::ToggleButton::textColourId, dimText);
+    enable.setButtonText (title);
     addAndMakeVisible (enable);
 }
 
 void ModulePanel::add (std::unique_ptr<LabeledControl> c)
 {
     addAndMakeVisible (*c);
+    c->addMouseListener (this, true);   // touching a control turns the stage on (see turnOnFromControl)
     controls.push_back (std::move (c));
 }
 
 juce::Rectangle<float> ModulePanel::ledArea() const
 {
-    // Just left of the ON switch.
-    const auto b = enable.getBounds().toFloat();
-    return { b.getX() - 18.0f, b.getCentreY() - 6.0f, 12.0f, 12.0f };
+    // Top-right corner of the panel.
+    const auto r = getLocalBounds().reduced (14, 10).toFloat();
+    return { r.getRight() - 12.0f, r.getY() + 3.0f, 12.0f, 12.0f };
 }
 
 juce::Rectangle<float> ModulePanel::meterArea() const
@@ -395,6 +499,34 @@ void ModulePanel::setActivity2 (float v)
     repaint (meterArea().expanded (2.0f).getSmallestIntegerContainer());
 }
 
+void ModulePanel::turnOnFromControl (const juce::MouseEvent& e)
+{
+    // Only for the user's own clicks / scrolls on a control in this stage, so presets,
+    // automation and reopening a session never switch a stage on by themselves.
+    if (e.eventComponent != this && ! enable.getToggleState())
+        enable.setToggleState (true, juce::sendNotificationSync);   // also updates the DAW parameter
+}
+
+void ModulePanel::mouseDown (const juce::MouseEvent& e)
+{
+    if (e.eventComponent != this) { turnOnFromControl (e); return; }
+    if (ledArea().expanded (6.0f).contains (e.position))
+        enable.triggerClick();   // same as clicking the stage name (keeps the DAW parameter in sync)
+}
+
+void ModulePanel::mouseWheelMove (const juce::MouseEvent& e, const juce::MouseWheelDetails& w)
+{
+    if (e.eventComponent != this) { turnOnFromControl (e); return; }
+    juce::Component::mouseWheelMove (e, w);
+}
+
+void ModulePanel::mouseMove (const juce::MouseEvent& e)
+{
+    if (e.eventComponent != this) return;   // cursor only for the panel itself (the LED)
+    setMouseCursor (ledArea().expanded (6.0f).contains (e.position) ? juce::MouseCursor::PointingHandCursor
+                                                                     : juce::MouseCursor::NormalCursor);
+}
+
 void ModulePanel::paint (juce::Graphics& g)
 {
     auto r = getLocalBounds().toFloat().reduced (4.0f);
@@ -407,9 +539,9 @@ void ModulePanel::paint (juce::Graphics& g)
     const auto led = ledArea();
     const bool  isOn = enable.getToggleState();
     const float a  = isOn ? activity : 0.0f;
-    const float a2 = isOn && splitMeter ? activity2 : 0.0f;
+    const float a2 = isOn && (splitMeter || ledFromSecond) ? activity2 : 0.0f;
     const juce::Colour hot { 0xffff7a3d };
-    const float la = ledFollowsBoth ? juce::jmax (a, a2) : a;
+    const float la = ledFromSecond ? a2 : (ledFollowsBoth ? juce::jmax (a, a2) : a);
     if (la > 0.02f)
     {
         g.setColour (hot.withAlpha (0.35f * la));
@@ -442,14 +574,12 @@ void ModulePanel::paint (juce::Graphics& g)
     else
         drawBar (meterArea(), a);
 
-    auto header = getLocalBounds().reduced (14, 10).removeFromTop (34).withTrimmedRight (80);  // leave room for LED + ON
+    auto header = getLocalBounds().reduced (14, 10).removeFromTop (34).withTrimmedRight (24);  // leave room for the LED
     g.setColour (accent);
     g.setFont (juce::FontOptions (13.0f, juce::Font::bold));
     g.drawText (number, header.removeFromLeft (22), juce::Justification::topLeft);
 
-    g.setColour (textCol);
-    g.setFont (juce::FontOptions (15.0f, juce::Font::bold));
-    g.drawText (title, header.removeFromTop (18), juce::Justification::topLeft);
+    header.removeFromTop (18);   // the title is drawn by the enable button
     g.setColour (dimText);
     g.setFont (juce::FontOptions (11.5f));
     g.drawText (subtitle, header, juce::Justification::topLeft);
@@ -459,18 +589,45 @@ void ModulePanel::resized()
 {
     auto r = getLocalBounds().reduced (12, 10);
     auto header = r.removeFromTop (38);
-    enable.setBounds (header.removeFromRight (56).removeFromTop (24));
+    {
+        // Title (click target) sits right after the stage number, as wide as its text.
+        auto t = getLocalBounds().reduced (14, 10).removeFromTop (18).withTrimmedRight (24);
+        t.removeFromLeft (22);
+        const int tw = (int) std::ceil (juce::GlyphArrangement::getStringWidth (TitleToggle::font(), title)) + 4;
+        enable.setBounds (t.withWidth (juce::jmin (tw, t.getWidth())));
+    }
     r.removeFromTop (10);   // room for the activity meter
 
     const int n = (int) controls.size();
     if (n == 0) return;
+
+    if ((int) colWeights.size() == n)
+    {
+        int total = 0;
+        for (int w : colWeights) total += w;
+        const int fullW = r.getWidth();
+        for (int i = 0; i < n; ++i)
+            controls[(size_t) i]->setBounds (r.removeFromLeft (fullW * colWeights[(size_t) i] / juce::jmax (1, total)));
+        return;
+    }
+
+    if (topWide && n > 1)
+    {
+        controls.front()->setBounds (r.removeFromTop (50));
+        r.removeFromTop (4);
+        const int cw = r.getWidth() / (n - 1);
+        for (int i = 1; i < n; ++i)
+            controls[(size_t) i]->setBounds (r.getX() + (i - 1) * cw, r.getY(), cw, r.getHeight());
+        return;
+    }
 
     if (sideStack && n > 1)
     {
         // Left column: every control but the last, stacked top to bottom. Right: the last one.
         auto left = r.removeFromLeft (r.getWidth() / 2);
         controls.back()->setBounds (r);
-        const int stackH = juce::jmin (left.getHeight() / (n - 1), 110);
+        // Several switches: up to 110 px each. A single (e.g. tall vertical) control can use the full height.
+        const int stackH = n - 1 == 1 ? left.getHeight() : juce::jmin (left.getHeight() / (n - 1), 110);
         left = left.withSizeKeepingCentre (left.getWidth(), stackH * (n - 1));
         for (int i = 0; i < n - 1; ++i)
             controls[(size_t) i]->setBounds (left.removeFromTop (stackH));
@@ -491,15 +648,17 @@ void ModulePanel::resized()
 //==============================================================================
 VocalChainEditor::VocalChainEditor (VocalChainProcessor& p)
     : AudioProcessorEditor (p), proc (p),
-      rider     ("1", "Volume Rider",    "Rides level to target  |  synced timing", 1),
-      comp1     ("2", "Comp-Gate",       "Classic de-ess + gate", 1),
-      problemEQ ("3", "Problem EQ",      "Finds and cuts resonances: low, mid, high", 2),
-      deEsser   ("4", "De-Esser",        "Finds the strongest S / SH and cuts it", 1),
-      pultec    ("5", "Pultec EQ",       "EQP-1A style program equalizer", 2),
-      comp2     ("6", "Compressor",      "Fast attack  |  auto release  |  auto makeup", 1),
-      tape      ("7", "Tape",            "Analog tape saturation", 2),
-      delay     ("8", "Delay",           "Synced to project tempo", 2),
-      filters   ("9", "Filters",         "High / low pass, 24 dB/oct", 1),
+      rider     ("1", "Volume Rider",    "Rides to target  |  noise floor  |  5 speeds", 1),
+      comp1     ("2", "Comp-Gate",       "Auto gate  |  threshold sets the de-ess", 1),
+      problemEQ ("3", "Problem EQ",      "Finds and cuts resonances: low, mid, high", 1),
+      warmAir   ("4", "Warmth / Air",    "Tube warmth  |  harmonic exciter", 2),
+      deEsser   ("5", "De-Esser",        "Finds the strongest S / SH and cuts it", 1),
+      pultec    ("6", "Pultec EQ",       "EQP-1A style program equalizer", 2),
+      comp2     ("7", "Compressor",      "Fast attack  |  auto release  |  auto makeup", 1),
+      tape      ("8", "Tape",            "Analog tape saturation", 2),
+      delay     ("9", "Delay",           "Synced to project tempo", 2),
+      reverb    ("10", "Reverb",         "Ducks under the vocal", 2),
+      filters   ("11", "Filters",        "High / low pass, 24 dB/oct", 2),
       analyzer  (p)
 {
     lnf.setColour (juce::Slider::rotarySliderFillColourId, accent);
@@ -517,33 +676,47 @@ VocalChainEditor::VocalChainEditor (VocalChainProcessor& p)
     setLookAndFeel (&lnf);
 
     analyzer.setWatermark (juce::ImageCache::getFromMemory (BinaryData::logo_png, BinaryData::logo_pngSize), "FXNKYCAT VOX");
-    // 1. Volume rider
-    rider.add (knob ("riderThresh", "Threshold"));
+    // 1. Volume rider: speed mode across the top, then noise floor and target.
+    if (auto* mode = dynamic_cast<juce::AudioParameterChoice*> (proc.apvts.getParameter ("riderMode")))
+        rider.add (std::make_unique<ui::LabeledControl> ("Speed", std::make_unique<ui::SegmentedSwitch> (*mode), true, 400));
+    rider.add (knob ("riderThresh", "Noise Floor"));
     rider.add (knob ("riderTarget", "Target Loudness"));
-    rider.setSplitMeter (true);   // left bar: level over threshold, right bar: how much it rides
+    rider.setTopWide (true);
+    rider.setSplitMeter (true);   // left bar: level over the noise floor, right bar: how much it moves the level
     bindEnable (rider, "riderOn");
 
     // 2. Light compressor
     comp1.add (knob ("comp1Thresh", "Threshold"));
+    comp1.setLedFromSecond (true);   // meter bar: de-esser, LED: gate
     bindEnable (comp1, "comp1On");
 
-    // 3. Problem EQ
+    // 4. Warmth & Air: Air on top, Warmth below
+    warmAir.add (knob ("air", "Air"));
+    warmAir.add (knob ("warmth", "Warmth"));
+    bindEnable (warmAir, "colorOn");
+
+    // 3. Problem EQ (its vocal range switch lives in the top bar)
+    problemEQ.add (knob ("deqThresh", "Threshold"));
+    bindEnable (problemEQ, "deqOn");
+
+    // Vocal range, top bar: Bass/Baritone | Tenor/Alto | Mezzo/Soprano
     if (auto* range = dynamic_cast<juce::AudioParameterChoice*> (proc.apvts.getParameter ("deqRange")))
     {
-        auto sw = std::make_unique<ui::SegmentedSwitch> (*range);
-        sw->setVertical (true);
-        sw->setReversed (true);   // Mezzo/Soprano on top, Bass/Baritone at the bottom
-        auto lc = std::make_unique<ui::LabeledControl> ("Vocal Range", std::move (sw), true, 150);
-        lc->setControlHeight (84);
-        problemEQ.add (std::move (lc));
+        rangeSwitch = std::make_unique<ui::SegmentedSwitch> (*range);
+        rangeSwitch->setTextOnly (true);
+        addAndMakeVisible (*rangeSwitch);
     }
-    problemEQ.add (knob ("deqThresh", "Threshold"));
-    problemEQ.setSideStack (true);
-    bindEnable (problemEQ, "deqOn");
 
     // 4. De-esser
     deEsser.add (knob ("deessSens", "Detection"));
+    {
+        // Solo: a light between the knobs; on = hear only what is being detected.
+        auto led = std::make_unique<ui::LedButton>();
+        buttonAtts.push_back (std::make_unique<APVTS::ButtonAttachment> (proc.apvts, "deessSolo", *led));
+        deEsser.add (std::make_unique<ui::LabeledControl> ("Solo", std::move (led), true, 40));
+    }
     deEsser.add (knob ("deessReduce", "Reduction"));
+    deEsser.setColumnWeights ({ 5, 2, 5 });
     deEsser.setSplitMeter (true);   // left bar: detection, right bar: reduction
     bindEnable (deEsser, "deessOn");
 
@@ -582,7 +755,21 @@ VocalChainEditor::VocalChainEditor (VocalChainProcessor& p)
     filters.add (knob ("lpFreq", "Low Pass"));
     bindEnable (filters, "filterOn");
 
-    for (auto* panel : { &rider, &comp1, &problemEQ, &deEsser, &pultec, &comp2, &tape, &delay, &filters })
+    // 9. Reverb: type buttons stacked on the left (Room, Hall, Plate, Chamber, Shimmer), mix on the right
+    if (auto* rt = dynamic_cast<juce::AudioParameterChoice*> (proc.apvts.getParameter ("revType")))
+    {
+        auto sw = std::make_unique<ui::SegmentedSwitch> (*rt);
+        sw->setVertical (true);
+        auto lc = std::make_unique<ui::LabeledControl> ("Type", std::move (sw), true, 84);
+        lc->setControlHeight (120);
+        reverb.add (std::move (lc));
+    }
+    reverb.add (knob ("revMix", "Mix"));
+    reverb.setSideStack (true);
+    reverb.setSplitMeter (true, true);   // left bar: reverb being added, right bar: how far it is ducked
+    bindEnable (reverb, "reverbOn");
+
+    for (auto* panel : { &rider, &comp1, &problemEQ, &warmAir, &deEsser, &pultec, &comp2, &tape, &delay, &reverb, &filters })
         addAndMakeVisible (panel);
 
     // Global Timing note value, top right. Scroll the mouse wheel over it or click to pick.
@@ -600,9 +787,17 @@ VocalChainEditor::VocalChainEditor (VocalChainProcessor& p)
     addAndMakeVisible (inHpfSlider);
 
     // Stage 5/6 order switch, top bar
-    buttonAtts.push_back (std::make_unique<APVTS::ButtonAttachment> (proc.apvts, "swap56", swapButton));
-    addAndMakeVisible (swapButton);
-    applySwap (swapButton.getToggleState());
+    if (auto* sp = proc.apvts.getParameter ("swap56"))
+    {
+        swapAtt = std::make_unique<juce::ParameterAttachment> (*sp, [this] (float v)
+        {
+            swapLed.setToggleState (v > 0.5f, juce::dontSendNotification);   // lit = swapped (compressor first)
+            applySwap (v > 0.5f);
+        });
+        swapAtt->sendInitialUpdate();
+    }
+    swapLed.onClick = [this] { if (swapAtt != nullptr) swapAtt->setValueAsCompleteGesture (swapLed.getToggleState() ? 1.0f : 0.0f); };
+    addAndMakeVisible (swapLed);
 
     bpmLabel.setJustificationType (juce::Justification::centredLeft);
     bpmLabel.setColour (juce::Label::textColourId, dimText);
@@ -612,6 +807,10 @@ VocalChainEditor::VocalChainEditor (VocalChainProcessor& p)
     // Output auto gain switch, top bar
     buttonAtts.push_back (std::make_unique<APVTS::ButtonAttachment> (proc.apvts, "autoGain", autoGainButton));
     addAndMakeVisible (autoGainButton);
+
+    // Plugin bypass, top bar (also the DAW's bypass for this plugin)
+    buttonAtts.push_back (std::make_unique<APVTS::ButtonAttachment> (proc.apvts, "bypass", bypassButton));
+    addAndMakeVisible (bypassButton);
 
     // Presets: pick a slot to load it; SAVE stores the current settings in a slot.
     presetBox.setTextWhenNothingSelected ("Choose preset...");
@@ -628,15 +827,15 @@ VocalChainEditor::VocalChainEditor (VocalChainProcessor& p)
 
     // Resizable from the bottom-right corner; panels, knobs and analyzer scale with the window.
     setResizable (true, true);
-    setResizeLimits (1300, 790, 2680, 1600);
-    setSize (1400, 900);
+    setResizeLimits (1480, 790, 2680, 1600);
+    setSize (1480, 900);
     startTimerHz (30);
 }
 
 void VocalChainEditor::timerCallback()
 {
     ui::ModulePanel* panels[VocalChainProcessor::kNumStages] =
-        { &rider, &comp1, &problemEQ, &deEsser, &pultec, &comp2, &tape, &delay, &filters };
+        { &rider, &comp1, &problemEQ, &warmAir, &deEsser, &pultec, &comp2, &tape, &delay, &reverb, &filters };
 
     for (int s = 0; s < VocalChainProcessor::kNumStages; ++s)
     {
@@ -652,8 +851,6 @@ void VocalChainEditor::timerCallback()
         panels[s]->setActivity2 (shownActivity2[s]);
     }
 
-    if (swapButton.getToggleState() != swapped)
-        applySwap (swapButton.getToggleState());
 
     const auto bpmText = juce::String (proc.hostBpm.load(), 1) + " BPM";
     if (bpmLabel.getText() != bpmText)
@@ -663,8 +860,8 @@ void VocalChainEditor::timerCallback()
 void VocalChainEditor::applySwap (bool s)
 {
     swapped = s;
-    pultec.setNumber (s ? "6" : "5");
-    comp2.setNumber  (s ? "5" : "6");
+    pultec.setNumber (s ? "7" : "6");
+    comp2.setNumber  (s ? "6" : "7");
     if (getWidth() > 0) resized();
     repaint();
 }
@@ -777,10 +974,11 @@ void VocalChainEditor::paint (juce::Graphics& g)
 
     g.setColour (accent);
     g.setFont (juce::FontOptions (12.0f, juce::Font::bold));
+    g.drawText ("BYPASS",    capBypass,   juce::Justification::centredRight);
     g.drawText ("INPUT HPF", capHpf,      juce::Justification::centredRight);
-    g.drawText ("5/6 ORDER", capSwap,     juce::Justification::centredRight);
     g.drawText ("TIMING",    capTiming,   juce::Justification::centredRight);
     g.drawText ("PRESET",    capPreset,   juce::Justification::centredRight);
+    g.drawText ("COMP/EQ SWAP", capSwap,  juce::Justification::centredRight);
     g.drawText ("AUTO GAIN", capAutoGain, juce::Justification::centredRight);
 
     // Thin divider under the top bar
@@ -794,26 +992,35 @@ void VocalChainEditor::resized()
     auto top = r.removeFromTop (52).reduced (8, 4);
     hdrDivider = { r.getX() + 8, r.getY() - 1, r.getWidth() - 16, 1 };
 
-    // One row. Right side (right to left): presets, then auto gain.
+    // One row. Right side (right to left): presets, auto gain, then the 5/6 order switch.
     saveButton.setBounds (top.removeFromRight (58).withSizeKeepingCentre (58, 28));
     top.removeFromRight (6);
-    presetBox.setBounds (top.removeFromRight (200).withSizeKeepingCentre (200, 30));
-    capPreset = top.removeFromRight (58);
+    presetBox.setBounds (top.removeFromRight (170).withSizeKeepingCentre (170, 30));
+    capPreset = top.removeFromRight (52);
     top.removeFromRight (14);
-    autoGainButton.setBounds (top.removeFromRight (90).withSizeKeepingCentre (90, 28));
-    capAutoGain = top.removeFromRight (80);
+    autoGainButton.setBounds (top.removeFromRight (26).withSizeKeepingCentre (26, 26));
+    capAutoGain = top.removeFromRight (72);
+    top.removeFromRight (8);
+    swapLed.setBounds (top.removeFromRight (26).withSizeKeepingCentre (26, 26));   // stage 5/6 order
+    capSwap = top.removeFromRight (100);
 
-    // Left side (left to right): input HPF, 5/6 order, timing + project tempo.
+    // Left side (left to right): bypass light, input HPF, timing + project tempo, vocal range.
+    capBypass = top.removeFromLeft (56);
+    bypassButton.setBounds (top.removeFromLeft (26).withSizeKeepingCentre (26, 26));
+    top.removeFromLeft (8);
     capHpf = top.removeFromLeft (70);
-    inHpfSlider.setBounds (top.removeFromLeft (170).withSizeKeepingCentre (170, 26));
-    top.removeFromLeft (12);
-    capSwap = top.removeFromLeft (80);
-    swapButton.setBounds (top.removeFromLeft (148).withSizeKeepingCentre (148, 28));
-    top.removeFromLeft (12);
-    capTiming = top.removeFromLeft (56);
+    inHpfSlider.setBounds (top.removeFromLeft (150).withSizeKeepingCentre (150, 26));
+    top.removeFromLeft (8);
+    capTiming = top.removeFromLeft (50);
     timingBox.setBounds (top.removeFromLeft (100).withSizeKeepingCentre (100, 30));
     top.removeFromLeft (6);
-    bpmLabel.setBounds (top.removeFromLeft (juce::jmin (130, top.getWidth())).withSizeKeepingCentre (juce::jmin (130, top.getWidth()), 28));
+    bpmLabel.setBounds (top.removeFromLeft (84).withSizeKeepingCentre (84, 28));
+    top.removeFromLeft (8);
+    if (rangeSwitch != nullptr)
+    {
+        const int rw = juce::jmin (270, top.getWidth());
+        rangeSwitch->setBounds (top.removeFromLeft (rw).withSizeKeepingCentre (rw, 28));
+    }
 
     r.removeFromBottom (8);
 
@@ -821,9 +1028,10 @@ void VocalChainEditor::resized()
 
     auto row1 = r.removeFromTop (r.getHeight() / 2 - 20);
     const int w1 = row1.getWidth();
-    rider.setBounds     (row1.removeFromLeft (w1 * 26 / 100));
-    comp1.setBounds     (row1.removeFromLeft (w1 * 18 / 100));
-    problemEQ.setBounds (row1.removeFromLeft (w1 * 24 / 100));
+    rider.setBounds     (row1.removeFromLeft (w1 * 24 / 100));
+    comp1.setBounds     (row1.removeFromLeft (w1 * 13 / 100));
+    problemEQ.setBounds (row1.removeFromLeft (w1 * 14 / 100));
+    warmAir.setBounds   (row1.removeFromLeft (w1 * 13 / 100));
     deEsser.setBounds   (row1);
 
     auto row2 = r;
@@ -831,15 +1039,16 @@ void VocalChainEditor::resized()
     // Stages 5 and 6 trade places when the order switch is flipped.
     if (swapped)
     {
-        comp2.setBounds  (row2.removeFromLeft (w2 * 22 / 100));
-        pultec.setBounds (row2.removeFromLeft (w2 * 38 / 100));
+        comp2.setBounds  (row2.removeFromLeft (w2 * 20 / 100));
+        pultec.setBounds (row2.removeFromLeft (w2 * 35 / 100));
     }
     else
     {
-        pultec.setBounds (row2.removeFromLeft (w2 * 38 / 100));
-        comp2.setBounds  (row2.removeFromLeft (w2 * 22 / 100));
+        pultec.setBounds (row2.removeFromLeft (w2 * 35 / 100));
+        comp2.setBounds  (row2.removeFromLeft (w2 * 20 / 100));
     }
-    tape.setBounds    (row2.removeFromLeft (w2 * 11 / 100));
-    delay.setBounds   (row2.removeFromLeft (w2 * 11 / 100));
+    tape.setBounds    (row2.removeFromLeft (w2 * 10 / 100));
+    delay.setBounds   (row2.removeFromLeft (w2 * 12 / 100));
+    reverb.setBounds  (row2.removeFromLeft (w2 * 13 / 100));
     filters.setBounds (row2);
 }

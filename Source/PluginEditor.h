@@ -55,14 +55,38 @@ namespace ui
                                float startAngle, float endAngle, juce::Slider&) override;
     };
 
+    // A stage's title that doubles as its on/off switch: gold when on, dim when off.
+    class TitleToggle : public juce::Button
+    {
+    public:
+        TitleToggle();
+        void paintButton (juce::Graphics&, bool highlighted, bool down) override;
+        static juce::Font font();
+    };
+
+    // A round light you click to toggle: dark when off, glowing when on.
+    class LedButton : public juce::Button
+    {
+    public:
+        LedButton();
+        void paintButton (juce::Graphics&, bool highlighted, bool down) override;
+    };
+
     // A two-state switch that shows different text for off / on (e.g. MALE / FEMALE).
     class SwitchButton : public juce::Button
     {
     public:
         SwitchButton (juce::String offText, juce::String onText);
         void paintButton (juce::Graphics&, bool highlighted, bool down) override;
+        void setOnLeft (bool l) { onLeft = l; repaint(); }   // draw the "on" option on the left
+        // Text-only look: no box, selected word gold, the other grey. Click a word to pick it.
+        void setTextOnly (bool t) { textOnly = t; setMouseCursor (juce::MouseCursor::PointingHandCursor); repaint(); }
+        void mouseDown (const juce::MouseEvent&) override;
+        void mouseUp (const juce::MouseEvent&) override;
     private:
+        bool onSelectedSide (const juce::MouseEvent&) const;
         juce::String off, on;
+        bool onLeft = false, textOnly = false, ignoreClick = false;
     };
 
     // Any control with a caption above it.
@@ -91,11 +115,15 @@ namespace ui
         void mouseDown (const juce::MouseEvent&) override;
         void setVertical (bool v) { vertical = v; repaint(); }   // options stacked top to bottom
         void setReversed (bool r) { reversed = r; repaint(); }   // show the last option first
+        // Text-only look: no box, selected word gold, the others grey (like the stage names).
+        void setTextOnly (bool t) { textOnly = t; setMouseCursor (juce::MouseCursor::PointingHandCursor); repaint(); }
+        void mouseMove (const juce::MouseEvent&) override;
+        void mouseExit (const juce::MouseEvent&) override;
     private:
         int slotFor (int option) const { return reversed ? options.size() - 1 - option : option; }
         juce::StringArray options;
-        int selected = 0;
-        bool vertical = false, reversed = false;
+        int selected = 0, hoverSlot = -1;
+        bool vertical = false, reversed = false, textOnly = false;
         juce::ParameterAttachment attachment;
     };
 
@@ -107,21 +135,34 @@ namespace ui
         void add (std::unique_ptr<LabeledControl> c);
         void paint (juce::Graphics&) override;
         void resized() override;
+        // Clicking the LED turns the stage on/off, same as clicking the title.
+        // Clicking, dragging or scrolling any control in the stage turns it on if it is off.
+        void mouseDown (const juce::MouseEvent&) override;
+        void mouseMove (const juce::MouseEvent&) override;
+        void mouseWheelMove (const juce::MouseEvent&, const juce::MouseWheelDetails&) override;
         void setActivity (float v);   // 0-1, drives the LED and meter bar
         // Split the meter into two bars side by side: left = v2 (setActivity2), right = setActivity.
         // ledBoth: the LED follows whichever bar is higher (otherwise only the right one).
         void setSplitMeter (bool s, bool ledBoth = false) { splitMeter = s; ledFollowsBoth = ledBoth; repaint(); }
+        // Single meter bar = setActivity, LED = setActivity2 (e.g. stage 2: bar = de-esser, LED = gate).
+        void setLedFromSecond (bool b) { ledFromSecond = b; repaint(); }
         void setActivity2 (float v);
         void setNumber (const juce::String& n) { if (n != number) { number = n; repaint(); } }
         // Switches stacked in a column on the left, the last control (a knob) on the right.
         void setSideStack (bool s) { sideStack = s; resized(); }
-        juce::ToggleButton enable;
+        // The first control gets its own full-width strip on top; the rest go in a row below.
+        void setTopWide (bool t) { topWide = t; resized(); }
+        // Single row with relative column widths (e.g. { 4, 1, 4 } for a narrow middle column).
+        void setColumnWeights (std::vector<int> w) { colWeights = std::move (w); resized(); }
+        TitleToggle enable;   // the stage title; click to turn the stage on/off
     private:
-        bool sideStack = false;
+        bool sideStack = false, topWide = false;
+        std::vector<int> colWeights;
         juce::Rectangle<float> ledArea() const;
+        void turnOnFromControl (const juce::MouseEvent&);
         juce::Rectangle<float> meterArea() const;
         float activity = 0.0f, activity2 = 0.0f;
-        bool  splitMeter = false, ledFollowsBoth = false;
+        bool  splitMeter = false, ledFollowsBoth = false, ledFromSecond = false;
         juce::String number, title, subtitle;
         int rows;
         std::vector<std::unique_ptr<LabeledControl>> controls;
@@ -153,15 +194,19 @@ private:
     float shownActivity2[VocalChainProcessor::kNumStages] {};   // left-hand bars of split meters
 
     // Panels first so they are destroyed after the attachments below.
-    ui::ModulePanel rider, comp1, problemEQ, deEsser, pultec, comp2, tape, delay, filters;
+    ui::ModulePanel rider, comp1, problemEQ, warmAir, deEsser, pultec, comp2, tape, delay, reverb, filters;
     juce::ComboBox timingBox;   // global Timing note value (scroll or click)
     juce::Label    bpmLabel;    // shows the project tempo
-    ui::SwitchButton swapButton { "EQ > COMP", "COMP > EQ" };   // order of stages 5 and 6
+    // COMP/EQ SWAP light: off = Pultec EQ (6) then Compressor (7), the default; lit = compressor first.
+    // Parameter "swap56" = compressor first, so the light simply shows it.
+    ui::LedButton swapLed;
+    std::unique_ptr<juce::ParameterAttachment> swapAtt;
     bool swapped = false;
     void applySwap (bool s);
     juce::Slider inHpfSlider { juce::Slider::LinearHorizontal, juce::Slider::TextBoxRight };   // input high-pass
 
-    ui::SwitchButton autoGainButton { "OFF", "ON" };              // output auto gain
+    ui::LedButton autoGainButton;                                  // output auto gain (light glows when on)
+    ui::LedButton bypassButton;                                     // whole-plugin bypass (light glows orange when on)
 
     // Presets: 10 user slots
     juce::ComboBox   presetBox;
@@ -171,7 +216,10 @@ private:
     void showSaveDialog();
 
     // Top bar areas, set in resized() and drawn in paint()
-    juce::Rectangle<int> capHpf, capSwap, capTiming, capPreset, capAutoGain, hdrDivider;
+    juce::Rectangle<int> capBypass, capHpf, capTiming, capPreset, capAutoGain, capSwap, hdrDivider;
+
+    // Vocal range (top bar): sets the detection ranges of stages 2, 3 and 4.
+    std::unique_ptr<ui::SegmentedSwitch> rangeSwitch;
     ui::SpectrumAnalyzer analyzer;
 
     std::vector<std::unique_ptr<APVTS::SliderAttachment>>   sliderAtts;

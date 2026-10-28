@@ -4,6 +4,7 @@
 // Everything is allocation-free on the audio thread (buffers are sized in prepare()).
 
 #include <algorithm>
+#include <array>
 #include <cmath>
 #include <vector>
 
@@ -139,41 +140,64 @@ struct SVF
 };
 
 //==============================================================================
-// 1. Volume rider
-// Measures a slow RMS level. When the level is above the threshold, it moves the
-// gain so the output sits at the target loudness. Below the threshold it eases
-// back to 0 dB (no change), so breaths/noise are not pushed up.
+// 1. Volume rider (vocal rider in the style of NoiseWorks GainAim)
+// Two parts, both stereo-linked:
+//   - Ride: a loudness average of the singing only (gaps and breaths are left out)
+//     moves the gain so the voice sits at the Target. Its speed comes from the
+//     speed mode. While the voice is under the noise floor, the ride holds still,
+//     so it never jumps up at the start of the next phrase.
+//   - Noise floor: a fast (20 ms) level check. Anything under the floor (breaths,
+//     room noise, bleed) is pulled down by as much as it is under, up to 12 dB.
+// Speed modes:
+//   Rider   - follows phrases (Timing note: 1x average, 1/4x down, 1x up), +/-12 dB
+//   Leveler - slow, evens out sections (4x average, 1x down, 4x up), +/-12 dB
+//   Fast    - follows words (50 ms / 10 ms / 50 ms), +/-12 dB
+//   Squash  - follows syllables (25 ms / 4 ms / 30 ms), +/-18 dB
+//   Locked  - pins the level to the target (12 ms / 2 ms / 12 ms), +/-24 dB
 struct VolumeRider
 {
-    static constexpr float kMaxRangeDb = 12.0f;
+    static constexpr float kFloorDepthDb = 12.0f;
 
-    float ms = 0, gainDb = 0;
-    float meter = 0;   // largest ride (dB, either direction) since last read
-    float overMeter = 0;   // most the level went over the threshold (dB) since last read
-    float rmsC = 0, downC = 0, upC = 0, idleC = 0;
+    float ms = 0, fastMs = 0, rideDb = 0, floorDb = 0;
+    float meter = 0;       // largest total gain change (dB, either direction) since last read
+    float overMeter = 0;   // most the level went over the noise floor (dB) since last read
+    float rmsC = 0, downC = 0, upC = 0, maxRangeDb = 12.0f;
+    float fastC = 0, floorDownC = 0, floorUpC = 0;
     double fs = 44100, lastBeat = -1;
+    int    lastMode = -1;
 
     void prepare (double sampleRate)
     {
         fs = sampleRate;
-        lastBeat = -1;
-        setTiming (0.5);
-        ms = 0; gainDb = 0;
+        lastBeat = -1; lastMode = -1;
+        setTiming (0.5, 0);
+        fastC      = timeCoef (0.020, fs);   // noise-floor detector: 20 ms
+        floorDownC = timeCoef (0.015, fs);   // duck noise over 15 ms
+        floorUpC   = timeCoef (0.005, fs);   // let the voice back in over 5 ms
+        ms = fastMs = 0; rideDb = floorDb = 0;
     }
 
-    // Timing follows the song. With 'beat' = the plugin's Timing note (1/4 by default):
-    // loudness window = 1 x, turn-down = 1/4 x, turn-up = 1 x, return to unity = 2 x.
-    void setTiming (double beat)
+    // 'beat' = the plugin's Timing note in seconds (Rider and Leveler follow it).
+    void setTiming (double beat, int mode)
     {
-        if (beat == lastBeat) return;
-        lastBeat = beat;
-        rmsC  = timeCoef (beat,         fs);
-        downC = timeCoef (beat * 0.25,  fs);
-        upC   = timeCoef (beat,         fs);
-        idleC = timeCoef (beat * 2.0,   fs);
+        if (beat == lastBeat && mode == lastMode) return;
+        lastBeat = beat; lastMode = mode;
+
+        double avg, down, up;
+        switch (mode)
+        {
+            case 1:  avg = beat * 4.0; down = beat;        up = beat * 4.0; maxRangeDb = 12.0f; break;  // Leveler
+            case 2:  avg = 0.050;      down = 0.010;       up = 0.050;      maxRangeDb = 12.0f; break;  // Fast
+            case 3:  avg = 0.025;      down = 0.004;       up = 0.030;      maxRangeDb = 18.0f; break;  // Squash
+            case 4:  avg = 0.012;      down = 0.002;       up = 0.012;      maxRangeDb = 24.0f; break;  // Locked
+            default: avg = beat;       down = beat * 0.25; up = beat;       maxRangeDb = 12.0f; break;  // Rider
+        }
+        rmsC  = timeCoef (avg,  fs);
+        downC = timeCoef (down, fs);
+        upC   = timeCoef (up,   fs);
     }
 
-    void process (float* const* ch, int nch, int n, float threshDb, float targetDb)
+    void process (float* const* ch, int nch, int n, float floorThreshDb, float targetDb)
     {
         for (int i = 0; i < n; ++i)
         {
@@ -181,25 +205,29 @@ struct VolumeRider
             for (int c = 0; c < nch; ++c) p += ch[c][i] * ch[c][i];
             p /= (float) nch;
 
-            ms = rmsC * ms + (1.0f - rmsC) * p;
-            const float levelDb = 10.0f * std::log10 (ms + 1.0e-12f);
+            fastMs = fastC * fastMs + (1.0f - fastC) * p;
+            const float fastDb = 10.0f * std::log10 (fastMs + 1.0e-12f);
+            const bool  voice  = fastDb > floorThreshDb;
 
-            float c;
-            float want = 0.0f;
-            if (levelDb > threshDb)
+            // Ride: only listens to (and moves during) the singing.
+            if (voice)
             {
-                overMeter = std::max (overMeter, levelDb - threshDb);
-                want = std::clamp (targetDb - levelDb, -kMaxRangeDb, kMaxRangeDb);
-                c = want < gainDb ? downC : upC;
-            }
-            else
-            {
-                c = idleC;
+                overMeter = std::max (overMeter, fastDb - floorThreshDb);
+                ms = ms <= 0.0f ? fastMs : rmsC * ms + (1.0f - rmsC) * p;   // start from the first word's level
+                const float levelDb = 10.0f * std::log10 (ms + 1.0e-12f);
+                const float want = std::clamp (targetDb - levelDb, -maxRangeDb, maxRangeDb);
+                const float c = want < rideDb ? downC : upC;
+                rideDb = c * rideDb + (1.0f - c) * want;
             }
 
-            gainDb = c * gainDb + (1.0f - c) * want;
-            meter = std::max (meter, std::abs (gainDb));
-            const float g = dbToGain (gainDb);
+            // Noise floor: pull down by how far under the floor, up to 12 dB.
+            const float floorWant = voice ? 0.0f : std::max (-kFloorDepthDb, fastDb - floorThreshDb);
+            const float fc = floorWant < floorDb ? floorDownC : floorUpC;
+            floorDb = fc * floorDb + (1.0f - fc) * floorWant;
+
+            const float totalDb = rideDb + floorDb;
+            meter = std::max (meter, std::abs (totalDb));
+            const float g = dbToGain (totalDb);
             for (int ch_ = 0; ch_ < nch; ++ch_) ch[ch_][i] *= g;
         }
     }
@@ -293,7 +321,10 @@ struct DynamicBand
 
     void setFreq (double fs, double freq, double q) { svf.setup (fs, freq, q); }
 
-    void process (float* const* ch, int nch, int n, float threshDb, float ratio, float maxCutDb)
+    // gate (optional, one value per sample, 0-1): scales the cut, e.g. "how sure are we
+    // this is sibilance". Null = always 1.
+    void process (float* const* ch, int nch, int n, float threshDb, float ratio, float maxCutDb,
+                  const float* gate = nullptr)
     {
         for (int i = 0; i < n; ++i)
         {
@@ -306,7 +337,8 @@ struct DynamicBand
             }
 
             env = follow (env, peak, attC, relC);
-            const float cutDb = std::min (maxCutDb, computeGR (gainToDb (env), threshDb, ratio, 4.0f));
+            const float gt = gate != nullptr ? gate[i] : 1.0f;
+            const float cutDb = std::min (maxCutDb, computeGR (gainToDb (env), threshDb, ratio, 4.0f)) * gt;
             meter = std::max (meter, cutDb);
             const float gm1   = dbToGain (-cutDb) - 1.0f;
 
@@ -316,16 +348,95 @@ struct DynamicBand
 };
 
 //==============================================================================
+// Sibilance detector, shared by the comp-gate's de-esser (stage 2) and the
+// de-esser (stage 4). Says how sure it is (0-1) that the sound right now is an
+// S, SH or CH. All three must hold:
+//   - the top end (from a little under the S/SH range) outweighs the body of the
+//     voice (below 1 kHz): sibilants are mostly hiss, vowels mostly lows/mids,
+//   - it is noise-like: a high zero-crossing rate. Pitched sounds (vowels, bright
+//     "ee"s, high notes, hums) cross far less often,
+//   - its energy sits in the S/SH range, not in the air above it (cymbals).
+// It has to hold for a few ms (4 ms on, 30 ms off), so single "t"/"k" clicks
+// barely count. The S/SH range follows the vocal range.
+struct SibilanceDetector
+{
+    // S/SH range for each vocal range: bass/baritone, tenor/alto, mezzo/soprano.
+    static constexpr double kLoHz[3] = { 2500.0, 3000.0, 3500.0 };
+    static constexpr double kHiHz[3] = { 8500.0, 10000.0, 11000.0 };
+
+    Biquad hfA, hfB, lfA, lfB, dc, airA, airB;   // mono, slot 0
+    double sr = 44100;
+    float hfMs = 0, lfMs = 0, airMs = 0, envC = 0, zcRate = 0, zcC = 0, prevX = 0, sib = 0, sibAtt = 0, sibRel = 0;
+    float lastRatioDb = 0, lastAirDb = 0, lastZc = 0;   // latest measurements (testing)
+
+    void prepare (double fs, int range)
+    {
+        sr = fs;
+        range = std::clamp (range, 0, 2);
+        const double hpHz = kLoHz[range] * 0.6;   // well under the S/SH range, so all of an "sh" is included
+        for (auto* b : { &hfA, &hfB }) { b->makeHighPass (fs, hpHz, 0.707);  b->reset(); }
+        for (auto* b : { &lfA, &lfB }) { b->makeLowPass  (fs, 1000.0, 0.707); b->reset(); }
+        dc.makeHighPass (fs, 80.0, 0.707); dc.reset();
+        const double airHz = std::min (kHiHz[range] * 1.1, fs * 0.45);
+        for (auto* b : { &airA, &airB }) { b->makeHighPass (fs, airHz, 0.707); b->reset(); }
+
+        envC   = timeCoef (0.004, fs);   // 4 ms level averages
+        zcC    = timeCoef (0.008, fs);   // 8 ms zero-crossing average
+        sibAtt = timeCoef (0.004, fs);   // on over 4 ms
+        sibRel = timeCoef (0.030, fs);   // off over 30 ms
+        hfMs = lfMs = airMs = zcRate = prevX = sib = 0;
+    }
+
+    // One mono sample in, sibilance confidence (0-1) out.
+    float process (float mono)
+    {
+        // Top end vs body, and S/SH range vs air
+        const float h   = hfB.process (hfA.process (mono, 0), 0);
+        const float l   = lfB.process (lfA.process (mono, 0), 0);
+        const float air = airB.process (airA.process (mono, 0), 0);
+        hfMs  = envC * hfMs  + (1.0f - envC) * h * h;
+        lfMs  = envC * lfMs  + (1.0f - envC) * l * l;
+        airMs = envC * airMs + (1.0f - envC) * air * air;
+
+        // Noise-likeness: zero crossings per second (rumble removed first)
+        const float x = dc.process (mono, 0);
+        const float crossed = ((x >= 0.0f) != (prevX >= 0.0f)) ? 1.0f : 0.0f;
+        prevX = x;
+        zcRate = zcC * zcRate + (1.0f - zcC) * crossed * (float) sr;
+
+        // hfMs includes the air band; take it out to get the S/SH range on its own.
+        const float sibBandMs = std::max (0.0f, hfMs - airMs);
+        const float ratioDb = 10.0f * std::log10 ((hfMs + 1.0e-12f) / (lfMs + 1.0e-12f));
+        const float airDb   = 10.0f * std::log10 ((sibBandMs + 1.0e-12f) / (airMs + 1.0e-12f));
+        // Tuned on test sounds: vowels/"ee"/high notes cross <= ~3.5k times/s and sibilants >= ~6k,
+        // breaths fail the top-end test and cymbals the S/SH-vs-air test.
+        const float a = std::clamp ((ratioDb + 3.0f) / 8.0f, 0.0f, 1.0f);       // top end over body: -3 dB -> 0, +5 dB -> 1
+        const float b = std::clamp ((zcRate - 4000.0f) / 3000.0f, 0.0f, 1.0f); // noise-like: 4k -> 0, 7k crossings/s -> 1
+        const float d = std::clamp ((airDb - 3.0f) / 6.0f, 0.0f, 1.0f);         // S/SH range over air: +3 -> 0, +9 dB -> 1
+        const float audible = hfMs > 1.0e-8f ? 1.0f : 0.0f;                     // ignore below ~-80 dB
+        lastRatioDb = ratioDb; lastAirDb = airDb; lastZc = zcRate;
+        sib = follow (sib, a * b * d * audible, sibAtt, sibRel);
+        return sib;
+    }
+};
+
+//==============================================================================
 // 2. Comp-gate in a classic "de-ess + gate" setup (modelled on how a C1-style
 // comp/gate is set up for vocals):
-//   - Gate first: wideband, fast open, short hold, smooth close to a -30 dB floor.
-//     Its threshold sits 40 dB under the main threshold, with 4 dB hysteresis.
+//   - Gate first: wideband, fast open, smooth close to a -30 dB floor, 4 dB hysteresis.
+//     It needs no threshold of its own: it opens at stage 1's Noise Floor when the
+//     Volume Rider is on, and otherwise sets itself 30 dB under the singing's own
+//     long-term level. Hold and close follow the Timing note (1/8 and 0.3 x).
 //   - Then split-band de-ess compression: the sidechain listens to a band around
-//     6 kHz and only that high band is turned down (4:1, near-hard knee, 0.5 ms / 50 ms).
-// One control: threshold.
+//     5 / 6 / 7 kHz (by vocal range) and only that high band is turned down (4:1, near-hard
+//     knee, 0.5 ms / 50 ms) - and only while the shared sibilance detector (same as
+//     stage 5) hears an S, SH or CH, so bright vowels and cymbals are left alone.
+// One control: Threshold, which sets the de-ess only.
 struct CompGate
 {
-    static constexpr float kGateOffsetDb = -40.0f, kGateHystDb = 4.0f, kGateFloorDb = -30.0f;
+    static constexpr float kAutoGateDb = -30.0f, kGateHystDb = 4.0f, kGateFloorDb = -30.0f;
+    float  longMs = 0, longC = 0, learnUpC = 0;   // singing's long-term level, for the automatic gate
+    double lastUnit = -1;
     static constexpr float kDeessRatio = 4.0f, kDeessMaxCutDb = 18.0f;
 
     DynamicBand deess;
@@ -333,47 +444,111 @@ struct CompGate
     float envAtt = 0, envRel = 0, openC = 0, closeC = 0;
     int   holdSamples = 0, holdLeft = 0;
     bool  open = false;
-    float meter = 0;   // most reduction (gate or de-ess) since last read
+    float meter = 0;       // most de-ess cut (dB) since last read
+    float gateMeter = 0;   // most gate reduction (dB) since last read
+
+    // Sidechain centre for each vocal range: bass/baritone, tenor/alto, mezzo/soprano.
+    static constexpr double kDeessHz[3] = { 5000.0, 6000.0, 7000.0 };
+    double sr = 44100;
+    int    range = 1;
+
+    // The de-ess only cuts while the shared detector hears an S / SH / CH.
+    static constexpr int kBlock = 512;
+    SibilanceDetector det;
+    std::array<float, kBlock> sibGate {};
+
+    void setRange (int r)
+    {
+        r = std::clamp (r, 0, 2);
+        if (r == range) return;
+        range = r;
+        deess.setFreq (sr, kDeessHz[range], 0.9);
+        det.prepare (sr, range);
+    }
 
     void prepare (double fs)
     {
-        deess.prepare (fs, 6000.0, 0.9, 0.5f, 50.0f);
+        sr = fs;
+        deess.prepare (fs, kDeessHz[range], 0.9, 0.5f, 50.0f);
+        det.prepare (fs, range);
         envAtt = timeCoef (0.0001, fs);   // 0.1 ms detector
         envRel = timeCoef (0.030, fs);
         openC  = timeCoef (0.0005, fs);   // opens in ~0.5 ms
-        closeC = timeCoef (0.150, fs);    // closes over ~150 ms
-        holdSamples = (int) (0.050 * fs); // 50 ms hold
+        longC  = timeCoef (3.0, fs);
+        learnUpC = timeCoef (0.2, fs);
+        lastUnit = -1; setTiming (0.5);
         holdLeft = 0;
-        gateEnv = 0; gateGainDb = kGateFloorDb; open = false;
+        gateEnv = longMs = 0; gateGainDb = kGateFloorDb; open = false;
     }
 
-    void process (float* const* ch, int nch, int n, float threshDb)
+    // unit = the Timing note in seconds: hold 1/8 of it, close over 0.3 x
+    // (50 ms / 150 ms at 120 BPM with the default 1/4 note).
+    void setTiming (double unit)
     {
-        const float openAt  = threshDb + kGateOffsetDb;
-        const float closeAt = openAt - kGateHystDb;
+        if (unit == lastUnit) return;
+        lastUnit = unit;
+        holdSamples = std::max (1, (int) (unit * 0.125 * sr));
+        closeC = timeCoef (std::max (0.02, unit * 0.3), sr);
+    }
 
-        // Gate
-        for (int i = 0; i < n; ++i)
+    // deessThreshDb: the stage 2 Threshold (de-ess only).
+    // useNoiseFloor: true when the Volume Rider is on; the gate then opens at its
+    // Noise Floor (an RMS level, so +3 dB for the gate's peak detector).
+    void process (float* const* ch, int nch, int n, float deessThreshDb, bool useNoiseFloor, float noiseFloorDb)
+    {
+        const float threshDb = deessThreshDb;
+
+        for (int start = 0; start < n; start += kBlock)
         {
-            float peak = 0;
-            for (int c = 0; c < nch; ++c) peak = std::max (peak, std::abs (ch[c][i]));
-            gateEnv = follow (gateEnv, peak, envAtt, envRel);
-            const float lvl = gainToDb (gateEnv);
+            const int len = std::min (kBlock, n - start);
+            float* sub[kMaxCh] {};
+            for (int c = 0; c < nch; ++c) sub[c] = ch[c] + start;
 
-            if (lvl > openAt)            { open = true; holdLeft = holdSamples; }
-            else if (lvl < closeAt)      { if (holdLeft > 0) --holdLeft; else open = false; }
+            // Gate
+            for (int i = 0; i < len; ++i)
+            {
+                float peak = 0;
+                for (int c = 0; c < nch; ++c) peak = std::max (peak, std::abs (sub[c][i]));
+                gateEnv = follow (gateEnv, peak, envAtt, envRel);
+                const float lvl = gainToDb (gateEnv);
 
-            const float target = open ? 0.0f : kGateFloorDb;
-            const float c = target > gateGainDb ? openC : closeC;
-            gateGainDb = c * gateGainDb + (1.0f - c) * target;
+                // Where the gate opens: the rider's noise floor, or 30 dB under the singing.
+                float openAt;
+                if (useNoiseFloor)
+                    openAt = noiseFloorDb + 3.0f;
+                else
+                {
+                    const float longDb = 10.0f * std::log10 (longMs + 1.0e-12f);
+                    if (lvl > -60.0f && (longMs <= 0.0f || lvl > longDb - 20.0f))   // learn from the singing only
+                    {
+                        // Catch up quickly when the singing is louder (0.2 s), forget slowly (3 s).
+                        const float e2 = gateEnv * gateEnv;
+                        longMs = e2 > longMs ? learnUpC * longMs + (1.0f - learnUpC) * e2
+                                             : longC * longMs + (1.0f - longC) * e2;
+                    }
+                    openAt = longMs > 0.0f ? 10.0f * std::log10 (longMs) + kAutoGateDb : -60.0f;
+                }
+                const float closeAt = openAt - kGateHystDb;
 
-            meter = std::max (meter, -gateGainDb);
-            const float g = dbToGain (gateGainDb);
-            for (int c2 = 0; c2 < nch; ++c2) ch[c2][i] *= g;
+                if (lvl > openAt)            { open = true; holdLeft = holdSamples; }
+                else if (lvl < closeAt)      { if (holdLeft > 0) --holdLeft; else open = false; }
+
+                const float target = open ? 0.0f : kGateFloorDb;
+                const float c = target > gateGainDb ? openC : closeC;
+                gateGainDb = c * gateGainDb + (1.0f - c) * target;
+
+                gateMeter = std::max (gateMeter, -gateGainDb);
+                const float g = dbToGain (gateGainDb);
+                float mono = 0;
+                for (int c2 = 0; c2 < nch; ++c2) { sub[c2][i] *= g; mono += sub[c2][i]; }
+
+                // Is this an S / SH / CH? (on the gated signal the de-ess works on)
+                sibGate[(size_t) i] = det.process (mono / (float) nch);
+            }
+
+            // Split-band de-ess compression, only while sibilance is detected
+            deess.process (sub, nch, len, threshDb, kDeessRatio, kDeessMaxCutDb, sibGate.data());
         }
-
-        // Split-band de-ess compression
-        deess.process (ch, nch, n, threshDb, kDeessRatio, kDeessMaxCutDb);
         meter = std::max (meter, deess.meter);
         deess.meter = 0;
     }
@@ -489,13 +664,17 @@ struct ResonanceTracker
         cut.setup (fs, std::exp ((double) curLogF), cutQ);
     }
 
-    void process (float* const* ch, int nch, int n, float threshDb, float ratio, float maxCutDb)
+    // gate (optional, one value per sample, 0-1): scales the cut, e.g. "how sure are we
+    // this is sibilance". Null = always 1.
+    void process (float* const* ch, int nch, int n, float threshDb, float ratio, float maxCutDb,
+                  const float* gate = nullptr)
     {
         for (int i = 0; i < n; ++i)
         {
             float mono = 0;
             for (int c = 0; c < nch; ++c) mono += ch[c][i];
             mono /= (float) nch;
+            const float gt = gate != nullptr ? gate[i] : 1.0f;
 
             for (int k = 0; k < kN; ++k)
             {
@@ -515,9 +694,9 @@ struct ResonanceTracker
 
             // Full cut once the spot stands 6 dB above its neighbours; none if it doesn't stand out.
             const float standOut = std::clamp (prom / 6.0f, 0.0f, 1.0f);
-            const float cutDb = std::min (maxCutDb, computeGR (gainToDb (cutEnv), threshDb, ratio, 4.0f)) * standOut;
+            const float cutDb = std::min (maxCutDb, computeGR (gainToDb (cutEnv), threshDb, ratio, 4.0f)) * standOut * gt;
             meter = std::max (meter, cutDb);
-            detMeter = std::max (detMeter, std::max (0.0f, gainToDb (cutEnv) - threshDb) * standOut);
+            detMeter = std::max (detMeter, std::max (0.0f, gainToDb (cutEnv) - threshDb) * standOut * gt);
             const float gm1 = dbToGain (-cutDb) - 1.0f;
 
             for (int c = 0; c < nch; ++c) ch[c][i] += gm1 * bp[c];
@@ -578,24 +757,91 @@ struct ProblemEQ
 
 //==============================================================================
 // 4. De-esser that finds the sibilance itself.
-// Scans 3-10 kHz ("sh" sits low in that range, "s" higher), follows whichever
-// frequency is loudest at that moment, and cuts a band there when it crosses the
-// detection threshold. Retargets within a few ms, so it can jump from an "sh" to an "s".
+// Scans the S/SH range (set by the vocal range; "sh" sits low in it, "s" higher),
+// follows whichever frequency is loudest at that moment, and cuts a band there when
+// it crosses the detection threshold - but only while the sound is classified as
+// sibilance (S, SH, CH). The classifier needs both:
+//   - the top end (above the S/SH range's low edge) to outweigh the body of the voice
+//     (below 1.5 kHz): sibilants are mostly hiss, vowels are mostly lows/mids, and
+//   - a noise-like signal: a high zero-crossing rate (above ~1.8-3.5k crossings/s).
+//     Pitched sounds (vowels, bright "ee"s, hums) cross far less often.
+// It has to hold for a few ms (3 ms attack), so single clicks like "t"/"k" barely count.
+// Solo (listen) plays what is being detected: the S/SH band, only while it is
+// classified as sibilance and over the detection threshold.
 struct DeEsser
 {
+    static constexpr int kBlock = 512;
+
     ResonanceTracker tracker;
+
+    // S/SH search range for each vocal range (shared with the detector).
+    static constexpr const double* kLoHz = SibilanceDetector::kLoHz;
+    static constexpr const double* kHiHz = SibilanceDetector::kHiHz;
+    double sr = 44100;
+    int    range = 1;
+
+    SibilanceDetector det;   // is this an S / SH / CH? (shared with stage 2)
+    Biquad hfA, hfB;         // S/SH band per channel (24 dB/oct high-pass), for Solo
+    std::array<float, kBlock> gate {};
+    std::array<std::array<float, kBlock>, kMaxCh> listen {};
 
     void prepare (double fs)
     {
-        tracker.prepare (fs, 3000.0, 10000.0, 1.6);
+        sr = fs;
+        // Keep the top of the search safely under Nyquist at low sample rates.
+        tracker.prepare (fs, kLoHz[range], std::min (kHiHz[range], fs * 0.45), 1.6);
         tracker.setStyle (true, 0.004, 0.005, 0.3f, 60.0f);  // 4 ms detect, 5 ms glide, 0.3/60 ms cut
+
+        det.prepare (fs, range);
+        const double hpHz = SibilanceDetector::kLoHz[range] * 0.6;   // same S/SH band the detector listens to
+        for (auto* b : { &hfA, &hfB }) { b->makeHighPass (fs, hpHz, 0.707); b->reset(); }
     }
 
-    // sensitivity: 0-100 %, reductionDb: max cut in dB
-    void process (float* const* ch, int nch, int n, float sensitivity, float reductionDb)
+    void setRange (int r)
+    {
+        r = std::clamp (r, 0, 2);
+        if (r == range) return;
+        range = r;
+        prepare (sr);   // rebuilds the search bands (only when the switch moves)
+    }
+
+    // sensitivity: 0-100 %, reductionDb: max cut in dB.
+    // listenOnly: replace the output with what is being detected (Solo).
+    void process (float* const* ch, int nch, int n, float sensitivity, float reductionDb, bool listenOnly = false)
     {
         const float threshDb = -6.0f - 0.44f * sensitivity;  // 0 % = -6 dB, 100 % = -50 dB
-        tracker.process (ch, nch, n, threshDb, 8.0f, reductionDb);
+
+        for (int start = 0; start < n; start += kBlock)
+        {
+            const int len = std::min (kBlock, n - start);
+            float* sub[kMaxCh] {};
+            for (int c = 0; c < nch; ++c) sub[c] = ch[c] + start;
+
+            for (int i = 0; i < len; ++i)
+            {
+                float mono = 0;
+                for (int c = 0; c < nch; ++c) mono += sub[c][i];
+                mono /= (float) nch;
+
+                const float sib = det.process (mono);
+                gate[(size_t) i] = sib;
+
+                if (listenOnly)
+                {
+                    // What is being detected: the S/SH band, while it is sibilance and over the threshold.
+                    const float hfDb = 10.0f * std::log10 (det.hfMs + 1.0e-12f) + 3.0f;   // RMS -> rough peak
+                    const float over = std::clamp ((hfDb - threshDb + 3.0f) / 6.0f, 0.0f, 1.0f);
+                    for (int c = 0; c < nch; ++c)
+                        listen[(size_t) c][(size_t) i] = hfB.process (hfA.process (sub[c][i], c), c) * sib * over;
+                }
+            }
+
+            tracker.process (sub, nch, len, threshDb, 8.0f, reductionDb, gate.data());
+
+            if (listenOnly)
+                for (int c = 0; c < nch; ++c)
+                    std::copy (listen[(size_t) c].begin(), listen[(size_t) c].begin() + len, sub[c]);
+        }
     }
 
     float takeMeter() { const float m = tracker.meter; tracker.meter = 0; return m; }
@@ -763,10 +1009,60 @@ struct TapeSaturation
 };
 
 //==============================================================================
+// Vocal ducker, shared by the delay and the reverb: while the vocal is coming in,
+// returns -12 dB by default (depthDb; reached over 20 ms); in the gaps it swells back to 0 dB over
+// the release time (set from the Timing note). "Coming in" = within 18 dB of the
+// vocal's own long-term level (3 s average) and above -55 dB, so it adapts to any
+// input level and needs no threshold.
+struct VocalDucker
+{
+    static constexpr float kDuckDb = 12.0f;
+    float depthDb = kDuckDb;   // how far to duck (the delay uses less)
+
+    float env = 0, envAtt = 0, envRel = 0, longMs = 0, longC = 0;
+    float duckDb = 0, downC = 0, upC = 0;
+    double fs = 44100, lastRel = -1;
+
+    void prepare (double sampleRate)
+    {
+        fs = sampleRate;
+        envAtt = timeCoef (0.001, fs); envRel = timeCoef (0.030, fs);
+        longC  = timeCoef (3.0, fs);
+        downC  = timeCoef (0.020, fs);
+        lastRel = -1; setRelease (0.125);
+        env = longMs = duckDb = 0;
+    }
+
+    void setRelease (double seconds)
+    {
+        if (seconds == lastRel) return;
+        lastRel = seconds;
+        upC = timeCoef (std::max (0.05, seconds), fs);
+    }
+
+    // One mono sample of the dry vocal in; duck amount in dB (0 or below) out.
+    float process (float x)
+    {
+        env = follow (env, std::abs (x), envAtt, envRel);
+        const float lvlDb = gainToDb (env);
+        const float p = x * x;
+        if (lvlDb > -60.0f) longMs = longMs <= 0.0f ? p : longC * longMs + (1.0f - longC) * p;
+        const float refDb = 10.0f * std::log10 (longMs + 1.0e-12f) + 3.0f;   // RMS -> rough peak
+        const bool  vocal = lvlDb > -55.0f && lvlDb > refDb - 18.0f;
+        duckDb = follow (duckDb, vocal ? -depthDb : 0.0f, upC, downC);
+        return duckDb;
+    }
+};
+
+//==============================================================================
 // Tempo delay. Repeats are filtered (150 Hz - 6 kHz) so they sit behind the vocal
 // and run at full level; 'mix' crossfades dry -> wet (equal-power, 0 = dry only).
+// The echoes duck 3 dB under the vocal (shared ducker design, the reverb ducks 12) and
+// swell back in the gaps; they keep repeating underneath, only their level dips.
 struct TempoDelay
 {
+    VocalDucker ducker;
+    float duckMeter = 0;   // how far the echoes are ducked (dB), largest since last read
     static constexpr float  kFeedback   = 0.35f;
     static constexpr double kMaxSeconds = 12.0;   // 2 bars of 4/4 at 40 BPM
 
@@ -787,6 +1083,8 @@ struct TempoDelay
         lpA = 1.0f - (float) std::exp (-2.0 * kPi * 6000.0 / fs);
         hpA = 1.0f - (float) std::exp (-2.0 * kPi * 150.0 / fs);
         for (int c = 0; c < kMaxCh; ++c) lp[c] = hp[c] = 0;
+        ducker.prepare (fs);
+        ducker.depthDb = 3.0f;   // much lighter than the reverb, so the echoes stay clearly audible
     }
 
     void process (float* const* ch, int nch, int n, float delaySeconds, float mix)
@@ -808,6 +1106,12 @@ struct TempoDelay
             const int   i1 = (i0 + 1) % size;
             const float fr = rp - (float) i0;
 
+            float mono = 0;
+            for (int c = 0; c < nch; ++c) mono += ch[c][i];
+            const float duckDb = ducker.process (mono / (float) nch);
+            duckMeter = std::max (duckMeter, -duckDb);
+            const float duckG = wetG * dbToGain (duckDb);
+
             for (int c = 0; c < nch; ++c)
             {
                 auto& b = buf[c];
@@ -818,8 +1122,8 @@ struct TempoDelay
                 const float wet = lp[c] - hp[c];
 
                 const float x = ch[c][i];
-                b[(size_t) writePos] = x + wet * kFeedback;
-                ch[c][i] = x * dryG + wet * wetG;
+                b[(size_t) writePos] = x + wet * kFeedback;   // repeats keep going at full level...
+                ch[c][i] = x * dryG + wet * duckG;            // ...only what you hear is ducked
             }
             writePos = (writePos + 1) % size;
         }
@@ -878,6 +1182,448 @@ struct InputHighPass
         for (int c = 0; c < nch; ++c)
             for (int i = 0; i < n; ++i)
                 ch[c][i] = s2.process (s1.process (ch[c][i], c), c);
+    }
+};
+
+//==============================================================================
+// Light compressor (background, between stages 3 and 4). No controls.
+// 1.5:1, 30 ms attack, release = the top-bar Timing note, 6 dB soft knee, RMS
+// detection (10 ms), stereo-linked.
+// Threshold sets itself: it follows the singing's own long-term loudness (a ~3 s
+// average that ignores silence and gaps), so only the parts louder than the
+// singer's average get gently pulled in.
+// Output is matched to the input (~1 s averages, 0 to +6 dB), so it never changes
+// the overall level - only evens it out.
+struct LightComp
+{
+    static constexpr float kRatio = 1.5f, kKneeDb = 6.0f, kMaxMakeupDb = 6.0f;
+
+    double fs = 44100, lastRel = -1;
+    float rmsMs = 0, rmsC = 0, longMs = 0, longC = 0;
+    float grDb = 0, attC = 0, relC = 0;
+    float inAvg = 0, outAvg = 0, avgC = 0, makeupDb = 0, mkC = 0;
+    float meter = 0;   // most gain reduction (dB) since last read
+
+    void prepare (double sampleRate)
+    {
+        fs = sampleRate;
+        rmsC = timeCoef (0.010, fs);
+        longC = timeCoef (3.0, fs);
+        attC = timeCoef (0.030, fs);
+        avgC = timeCoef (1.0, fs);
+        mkC  = timeCoef (0.5, fs);
+        lastRel = -1;
+        setRelease (0.5);
+        rmsMs = longMs = grDb = inAvg = outAvg = makeupDb = 0;
+    }
+
+    void setRelease (double seconds)
+    {
+        if (seconds == lastRel) return;
+        lastRel = seconds;
+        relC = timeCoef (std::max (0.02, seconds), fs);
+    }
+
+    void process (float* const* ch, int nch, int n)
+    {
+        for (int i = 0; i < n; ++i)
+        {
+            float p = 0;
+            for (int c = 0; c < nch; ++c) p += ch[c][i] * ch[c][i];
+            p /= (float) nch;
+
+            rmsMs = rmsC * rmsMs + (1.0f - rmsC) * p;
+            const float lvl = 10.0f * std::log10 (rmsMs + 1.0e-12f);
+
+            // Auto threshold: long-term loudness of the singing only.
+            float thrDb = 10.0f * std::log10 (longMs + 1.0e-12f);
+            const bool singing = lvl > -60.0f && (longMs <= 0.0f || lvl > thrDb - 20.0f);
+            if (singing)
+            {
+                longMs = longMs <= 0.0f ? rmsMs : longC * longMs + (1.0f - longC) * rmsMs;
+                thrDb = 10.0f * std::log10 (longMs + 1.0e-12f);
+            }
+
+            const float target = longMs > 0.0f ? computeGR (lvl, thrDb, kRatio, kKneeDb) : 0.0f;
+            grDb = target > grDb ? attC * grDb + (1.0f - attC) * target
+                                 : relC * grDb + (1.0f - relC) * target;
+            meter = std::max (meter, grDb);
+
+            const float g = dbToGain (-grDb);
+
+            // Match output to input (held during silence).
+            if (singing)
+            {
+                inAvg  = avgC * inAvg  + (1.0f - avgC) * p;
+                outAvg = avgC * outAvg + (1.0f - avgC) * p * g * g;
+            }
+            const float mkTarget = (inAvg > 1.0e-9f && outAvg > 1.0e-9f)
+                                     ? std::clamp (10.0f * std::log10 (inAvg / outAvg), 0.0f, kMaxMakeupDb) : 0.0f;
+            makeupDb = mkC * makeupDb + (1.0f - mkC) * mkTarget;
+
+            const float total = g * dbToGain (makeupDb);
+            for (int c = 0; c < nch; ++c) ch[c][i] *= total;
+        }
+    }
+};
+
+//==============================================================================
+// Warmth & Air (stage 4, after the background compressor). Two knobs, 0-100 %.
+// Warmth - vintage tube-style saturation: a biased (asymmetric) tanh stage, so it
+//   adds mostly even harmonics like a triode, driven up to +18 dB. The curve is
+//   loudness-matched (~150 ms averages), so turning it up adds colour and rounds
+//   peaks without changing the level. A small low-mid lift (180 / 250 / 320 Hz by
+//   vocal range, up to
+//   +2 dB) and a soft top (7 kHz shelf, up to -2 dB) give the "vintage" tone.
+// Air - harmonic exciter: takes the top of the voice (above 3 / 3.5 / 4.2 kHz by
+//   vocal range), normalises it
+//   to a steady level so it works the same on quiet and loud lines, bends it
+//   through a soft asymmetric curve to create new upper harmonics, keeps only what
+//   lands above 5 / 6 / 7 kHz, and blends that in. Adds sheen and openness without the
+//   harshness of a plain treble boost.
+struct WarmthAir
+{
+    static constexpr float kBias = 0.15f;      // tube bias -> even harmonics
+    static constexpr float kAirLevel = 2.0f;   // exciter blend at 100 %
+
+    Biquad lowMid, softTop;          // warmth tone
+    Biquad airHp1, airHp2;           // exciter input band (3 / 3.5 / 4.2 kHz by vocal range)
+    Biquad genHp1, genHp2;           // keep only new harmonics above 5 / 6 / 7 kHz
+    float  dcX[kMaxCh] {}, dcY[kMaxCh] {}, dcR = 0.995f;
+    float  airEnv[kMaxCh] {}, envAtt = 0, envRel = 0;
+    float  lastWarm = -1, lastWarmAmt = 0, lastAirAmt = 0;
+    float  wIn[kMaxCh] {}, wOut[kMaxCh] {}, wGain[kMaxCh] { 1.0f, 1.0f }, matchC = 0;   // warmth loudness match
+    double fs = 44100;
+
+    // Follow the top-bar vocal range: bass/baritone, tenor/alto, mezzo/soprano.
+    static constexpr double kLiftHz[3]   = { 180.0, 250.0, 320.0 };    // Warmth body lift
+    static constexpr double kAirInHz[3]  = { 3000.0, 3500.0, 4200.0 }; // Air: top of the voice it excites
+    static constexpr double kAirOutHz[3] = { 5000.0, 6000.0, 7000.0 }; // Air: new harmonics kept above
+    int range = -1;
+
+    void setVocalRange (int r)
+    {
+        r = std::clamp (r, 0, 2);
+        if (r == range) return;
+        range = r;
+        airHp1.makeHighPass (fs, kAirInHz[r], 0.707);  airHp2.makeHighPass (fs, kAirInHz[r], 0.707);
+        genHp1.makeHighPass (fs, kAirOutHz[r], 0.707); genHp2.makeHighPass (fs, kAirOutHz[r], 0.707);
+        lastWarm = -1;   // re-tune the warmth lift on the next block
+    }
+
+    void prepare (double sampleRate)
+    {
+        fs = sampleRate;
+        for (auto* b : { &lowMid, &softTop, &airHp1, &airHp2, &genHp1, &genHp2 }) b->reset();
+        range = -1; setVocalRange (1);
+        dcR = 1.0f - (float) (2.0 * kPi * 10.0 / fs);
+        envAtt = timeCoef (0.001, fs); envRel = timeCoef (0.030, fs);
+        for (int c = 0; c < kMaxCh; ++c) dcX[c] = dcY[c] = airEnv[c] = 0;
+        lastWarm = -1; lastWarmAmt = lastAirAmt = 0;
+        matchC = timeCoef (0.150, fs);
+        for (int c = 0; c < kMaxCh; ++c) { wIn[c] = wOut[c] = 0; wGain[c] = 1.0f; }
+    }
+
+    static inline float tube (float x, float drive)
+    {
+        // Biased tanh, minus its resting point, divided by its slope at rest -> unity gain for small signals.
+        const float t0 = std::tanh (kBias);
+        const float slope = drive * (1.0f - t0 * t0);
+        return (std::tanh (drive * x + kBias) - t0) / slope;
+    }
+
+    // warmth, air: 0-100 %
+    void process (float* const* ch, int nch, int n, float warmth, float air)
+    {
+        const float w = std::clamp (warmth * 0.01f, 0.0f, 1.0f);
+        const float a = std::clamp (air * 0.01f, 0.0f, 1.0f);
+        if (w <= 0.0f && a <= 0.0f && lastWarmAmt <= 0.0f && lastAirAmt <= 0.0f) return;
+
+        if (w != lastWarm)
+        {
+            lastWarm = w;
+            lowMid.makePeak (fs, kLiftHz[std::max (0, range)], 0.7, 2.0 * w);
+            softTop.makeHighShelf (fs, 7000.0, 0.7, -2.0 * w);
+        }
+        const float drive = dbToGain (18.0f * w);
+        const float w0 = lastWarmAmt, a0 = lastAirAmt;
+        lastWarmAmt = w; lastAirAmt = a;
+
+        for (int c = 0; c < nch; ++c)
+        {
+            float* d = ch[c];
+            for (int i = 0; i < n; ++i)
+            {
+                const float t  = (float) (i + 1) / (float) n;
+                const float wm = w0 + (w - w0) * t;   // smoothed amounts (no zipper noise)
+                const float am = a0 + (a - a0) * t;
+                float x = d[i];
+
+                // --- Warmth ---
+                if (wm > 0.0f)
+                {
+                    float s = tube (lowMid.process (x, c), drive);
+                    const float y = s - dcX[c] + dcR * dcY[c];   // remove the DC the bias creates
+                    dcX[c] = s; dcY[c] = y;
+                    s = softTop.process (y, c);
+                    // Keep the warmth path as loud as what went in (held during silence).
+                    wIn[c]  = matchC * wIn[c]  + (1.0f - matchC) * x * x;
+                    wOut[c] = matchC * wOut[c] + (1.0f - matchC) * s * s;
+                    if (wIn[c] > 1.0e-9f && wOut[c] > 1.0e-9f)
+                    {
+                        const float target = std::clamp (std::sqrt (wIn[c] / wOut[c]), 0.25f, 4.0f);
+                        wGain[c] = matchC * wGain[c] + (1.0f - matchC) * target;
+                    }
+                    s *= wGain[c];
+                    x += (s - x) * std::min (1.0f, wm * 4.0f);  // fades in over the first 25 %
+                }
+
+                // --- Air ---
+                if (am > 0.0f)
+                {
+                    const float band = airHp2.process (airHp1.process (x, c), c);
+                    airEnv[c] = follow (airEnv[c], std::abs (band), envAtt, envRel);
+                    const float u  = band / (airEnv[c] + 1.0e-6f);              // steady level, ~ +/-1
+                    const float th = std::tanh (3.0f * u);
+                    const float gen = (th + 0.3f * th * th) * airEnv[c];       // asymmetric -> odd + even harmonics
+                    const float top = genHp2.process (genHp1.process (gen, c), c);
+                    x += top * am * kAirLevel;
+                }
+                d[i] = x;
+            }
+        }
+    }
+};
+
+//==============================================================================
+// Reverb (stage 10) with automatic ducking.
+// An 8-line feedback delay network (Hadamard mixing, damping in each loop) fed
+// through pre-delay and 4 diffusion all-passes. The wet signal always goes through
+// a fixed 250 Hz high-pass and 6 kHz low-pass (12 dB/oct each), so the reverb
+// stays out of the low end and the sibilance, plus a gentle -1.5 dB dip at 1.5 /
+// 2.1 / 3 kHz (by vocal range) so it sits behind the voice's presence. The dry
+// vocal is not filtered.
+// Types (in switch order):
+// Pre-delay and length follow the song tempo (see kTypes), e.g. at 120 BPM:
+//   Room    - small, darker, ~8 ms pre-delay (1/256 note), ~1 s (2 beats)
+//   Hall    - big, ~31 ms (1/64 note), ~3 s (6 beats)
+//   Plate   - dense and bright, ~16 ms (1/128 note), ~2.5 s (5 beats)
+//   Chamber - large and smooth, ~23 ms (3/256 note), ~2 s (4 beats)
+//   Shimmer - long hall, ~31 ms (1/64 note), ~4 s (8 beats), with an octave-up
+//             copy of the tail fed back in, so it blooms upward
+// Ducking (VocalDucker, same as the delay): -12 dB while the vocal is coming in,
+// swelling back in the gaps, so the tail fills them and the vocal stays clear.
+// Mix: 0-100 % reverb added on top of the untouched dry signal.
+struct DuckingReverb
+{
+    static constexpr int kLines = 8, kDiff = 4;
+    // preNote / lenBeats follow the song tempo: pre-delay as a fraction of a 1/4 note,
+    // length (time to fade 60 dB) in beats. baseRt60 bounds the length to 0.5x-2x so
+    // very slow or very fast songs stay sensible.
+    struct Type { float preNote, size, lenBeats, baseRt60, dampHz, diffusion, width, shimmer; };
+    static constexpr int kNumTypes = 5;
+    static constexpr Type kTypes[kNumTypes] = {
+        { 1.0f / 64.0f, 0.40f, 2.0f, 1.1f, 5000.0f, 0.60f, 0.8f, 0.0f  },   // room    - 1/256 note, 2 beats
+        { 1.0f / 16.0f, 1.00f, 6.0f, 3.2f, 7000.0f, 0.72f, 1.0f, 0.0f  },   // hall    - 1/64 note,  6 beats
+        { 1.0f / 32.0f, 0.65f, 5.0f, 2.8f, 9000.0f, 0.75f, 1.0f, 0.0f  },   // plate   - 1/128 note, 5 beats
+        { 3.0f / 64.0f, 0.90f, 4.0f, 2.2f, 6500.0f, 0.70f, 1.0f, 0.0f  },   // chamber - 3/256 note, 4 beats
+        { 1.0f / 16.0f, 1.00f, 8.0f, 4.0f, 8000.0f, 0.75f, 1.0f, 0.35f },   // shimmer - 1/64 note,  8 beats
+    };
+    static constexpr float kLineMs[kLines] = { 29.7f, 37.1f, 41.1f, 43.7f, 53.3f, 59.9f, 67.7f, 73.1f };
+    static constexpr float kDiffMs[kDiff]  = { 4.7f, 3.6f, 12.7f, 9.3f };
+    static constexpr float kDuckDb = VocalDucker::kDuckDb;
+    static constexpr float kWetGain = 3.5f;   // ~+11 dB (makes up for the 250 Hz / 6 kHz wet filters), so full Mix is a big, obvious reverb
+
+    std::vector<float> line[kLines], diff[kDiff], pre;
+    int   len[kLines] {}, pos[kLines] {}, diffLen[kDiff] {}, diffPos[kDiff] {}, preLen = 1, prePos = 0;
+    float fb[kLines] {}, lpZ[kLines] {}, lpA = 0, diffG = 0.7f, width = 1.0f, shimmer = 0.0f;
+    Biquad wetHp, wetLp;   // fixed 250 Hz high-pass and 6 kHz low-pass on the wet signal
+    Biquad wetDip;         // -1.5 dB mid dip, centre set by the vocal range
+    static constexpr double kDipHz[3] = { 1500.0, 2100.0, 3000.0 };   // bass/baritone, tenor/alto, mezzo/soprano
+    int dipRange = -1;
+
+    void setVocalRange (int r)
+    {
+        r = std::clamp (r, 0, 2);
+        if (r == dipRange) return;
+        dipRange = r;
+        wetDip.makePeak (fs, kDipHz[r], 1.0, -1.5);   // broad (Q 1), so it shapes the whole 1.5-3 kHz area gently
+    }
+
+    // Shimmer: octave-up pitch shifter (two crossfaded taps reading at double speed)
+    std::vector<float> psBuf;
+    int   psPos = 0, psW = 1;
+    float psPhase = 0, prevOut = 0;
+
+    float pitchUp (float in)
+    {
+        const int size = (int) psBuf.size();
+        psBuf[(size_t) psPos] = in;
+        float out = 0;
+        for (int tap = 0; tap < 2; ++tap)
+        {
+            float ph = psPhase + 0.5f * (float) tap;
+            if (ph >= 1.0f) ph -= 1.0f;
+            const float d   = 1.0f + (float) psW * (1.0f - ph);   // delay shrinks 1 sample per sample = 2x speed
+            float rp = (float) psPos - d;
+            while (rp < 0.0f) rp += (float) size;
+            const int   i0 = (int) rp;
+            const float fr = rp - (float) i0;
+            const float s  = psBuf[(size_t) i0] + fr * (psBuf[(size_t) ((i0 + 1) % size)] - psBuf[(size_t) i0]);
+            const float w  = std::sin ((float) kPi * ph);
+            out += s * w * w;   // the two windows add up to 1
+        }
+        psPhase += 1.0f / (float) psW;
+        if (psPhase >= 1.0f) psPhase -= 1.0f;
+        psPos = (psPos + 1) % size;
+        return out;
+    }
+    double fs = 44100;
+    int    type = -1;
+
+    VocalDucker ducker;   // shared design with the delay
+    float  lastMix = 0;
+    double quarterSec = 0.5, appliedQuarter = -1;   // song tempo (one 1/4 note, seconds)
+    float meter = 0;   // how far the reverb is ducked right now (dB), largest since last read
+
+    void prepare (double sampleRate)
+    {
+        fs = sampleRate;
+        for (int k = 0; k < kLines; ++k) line[k].assign ((size_t) (kLineMs[k] * 0.001 * fs) + 4, 0.0f);
+        for (int k = 0; k < kDiff; ++k)  diff[k].assign ((size_t) (kDiffMs[k] * 0.001 * fs) + 4, 0.0f);
+        pre.assign ((size_t) (0.120 * fs) + 4, 0.0f);   // room for 1/64 note at 40 BPM
+        std::fill (lpZ, lpZ + kLines, 0.0f);
+        std::fill (pos, pos + kLines, 0); std::fill (diffPos, diffPos + kDiff, 0); prePos = 0;
+        wetHp.makeHighPass (fs, 250.0, 0.707);  wetHp.reset();
+        wetLp.makeLowPass  (fs, 6000.0, 0.707); wetLp.reset();
+        wetDip.reset(); dipRange = -1; setVocalRange (1);
+        psW = std::max (16, (int) (0.050 * fs));   // 50 ms grains
+        psBuf.assign ((size_t) psW + 8, 0.0f);
+        psPos = 0; psPhase = 0; prevOut = 0;
+        ducker.prepare (fs);
+        lastMix = 0;
+        type = -1; appliedQuarter = -1; setType (2);
+    }
+
+    void setRelease (double seconds) { ducker.setRelease (seconds); }
+
+    // Song tempo (one 1/4 note in seconds): re-tunes pre-delay and length when it moves.
+    void setTempo (double quarterSeconds)
+    {
+        quarterSec = std::clamp (quarterSeconds, 0.1, 2.0);
+        if (type >= 0 && std::abs (quarterSec - appliedQuarter) > 0.005 * appliedQuarter)
+            applyType();
+    }
+
+    void setType (int t)
+    {
+        t = std::clamp (t, 0, kNumTypes - 1);
+        if (t == type) return;
+        type = t;
+        applyType();
+    }
+
+    void applyType()
+    {
+        appliedQuarter = quarterSec;
+        const auto& p = kTypes[type];
+        const float rt60 = std::clamp (p.lenBeats * (float) quarterSec, 0.5f * p.baseRt60, 2.0f * p.baseRt60);
+        for (int k = 0; k < kLines; ++k)
+        {
+            len[k] = std::clamp ((int) (kLineMs[k] * p.size * 0.001 * fs), 1, (int) line[k].size() - 1);
+            pos[k] %= len[k];
+            fb[k]  = std::pow (10.0f, -3.0f * (float) len[k] / (rt60 * (float) fs));   // RT60 decay per loop
+        }
+        for (int k = 0; k < kDiff; ++k)
+        {
+            diffLen[k] = std::clamp ((int) (kDiffMs[k] * (0.5f + 0.5f * p.size) * 0.001 * fs), 1, (int) diff[k].size() - 1);
+            diffPos[k] %= diffLen[k];
+        }
+        preLen = std::clamp ((int) (p.preNote * quarterSec * fs), 1, (int) pre.size() - 1);
+        lpA    = (float) std::exp (-2.0 * kPi * p.dampHz / fs);
+        diffG  = p.diffusion;
+        width  = p.width;
+        shimmer = p.shimmer;
+    }
+
+    // mix: 0-1
+    void process (float* const* ch, int nch, int n, float mix)
+    {
+        if (mix <= 0.0f && lastMix <= 0.0f) { lastMix = 0.0f; return; }
+        const float mix0 = lastMix;
+        lastMix = mix;
+        const int preSize = (int) pre.size();
+
+        for (int i = 0; i < n; ++i)
+        {
+            float x = 0;
+            for (int c = 0; c < nch; ++c) x += ch[c][i];
+            x /= (float) nch;
+
+            // --- Ducking: is the vocal coming in right now? ---
+            const float duckDb = ducker.process (x);
+            meter = std::max (meter, -duckDb);
+
+            // --- Pre-delay ---
+            pre[(size_t) prePos] = x;
+            float y = pre[(size_t) ((prePos - preLen + preSize) % preSize)];
+            prePos = (prePos + 1) % preSize;
+
+            // --- Input diffusion (Schroeder all-passes) ---
+            for (int k = 0; k < kDiff; ++k)
+            {
+                float& slot = diff[k][(size_t) diffPos[k]];
+                const float v = slot;
+                const float out = v - diffG * y;
+                slot = y + diffG * out;
+                y = out;
+                diffPos[k] = (diffPos[k] + 1) % diffLen[k];
+            }
+
+            // --- Shimmer: feed an octave-up copy of the tail back in (soft-limited) ---
+            if (shimmer > 0.0f)
+                y += std::tanh (pitchUp (prevOut) * shimmer);
+
+            // --- FDN ---
+            float o[kLines];
+            for (int k = 0; k < kLines; ++k)
+            {
+                o[k] = line[k][(size_t) pos[k]];
+                lpZ[k] = o[k] + lpA * (lpZ[k] - o[k]);   // damping
+            }
+            float h[kLines];
+            std::copy (lpZ, lpZ + kLines, h);
+            for (int s = 1; s < kLines; s <<= 1)          // fast Hadamard
+                for (int a = 0; a < kLines; a += s << 1)
+                    for (int b = a; b < a + s; ++b)
+                    {
+                        const float u = h[b], v = h[b + s];
+                        h[b] = u + v; h[b + s] = u - v;
+                    }
+            constexpr float norm = 0.35355339f;           // 1/sqrt(8)
+            for (int k = 0; k < kLines; ++k)
+            {
+                line[k][(size_t) pos[k]] = h[k] * norm * fb[k] + y * ((k & 1) ? -0.5f : 0.5f);
+                pos[k] = (pos[k] + 1) % len[k];
+            }
+
+            float wl = (o[0] - o[2] + o[4] - o[6]) * 0.5f;
+            float wr = (o[1] - o[3] + o[5] - o[7]) * 0.5f;
+            const float mid = 0.5f * (wl + wr), side = 0.5f * (wl - wr) * width;
+            wl = mid + side; wr = mid - side;
+            prevOut = mid;
+
+            const float m = mix0 + (mix - mix0) * (float) (i + 1) / (float) n;
+            const float g = m * kWetGain * dbToGain (duckDb);
+            auto filt = [&] (float v, int c) { return wetDip.process (wetLp.process (wetHp.process (v, c), c), c); };
+            if (nch > 1)
+            {
+                ch[0][i] += filt (wl, 0) * g;
+                ch[1][i] += filt (wr, 1) * g;
+            }
+            else
+                ch[0][i] += filt (mid, 0) * g;
+        }
     }
 };
 

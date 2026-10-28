@@ -58,14 +58,16 @@ APVTS::ParameterLayout VocalChainProcessor::createLayout()
 
     // Output auto gain: keeps the output about as loud as the input
     l.add (bparam ("autoGain", "Auto Gain", false));
+    l.add (bparam ("bypass", "Bypass", false));   // whole plugin; also the DAW's own bypass
 
     // Global timing note value. Tempo itself comes from the project (host).
     l.add (cparam ("division", "Timing", divisionNames(), 6));   // default 1/4
 
     // 1. Volume rider
     l.add (bparam ("riderOn", "Rider On", false));
-    l.add (fparam ("riderThresh", "Rider Threshold", -60.0f, 0.0f, 0.0f, "dB"));
+    l.add (fparam ("riderThresh", "Rider Noise Floor", -60.0f, 0.0f, 0.0f, "dB"));
     l.add (fparam ("riderTarget", "Rider Target", -40.0f, 0.0f, -18.0f, "dB"));
+    l.add (cparam ("riderMode", "Rider Speed", { "Rider", "Leveler", "Fast", "Squash", "Locked" }, 0));
 
     // 2. Light compressor (2:1, 1 ms attack, 1/4 note release)
     l.add (bparam ("comp1On", "Comp-Gate On", false));
@@ -74,13 +76,16 @@ APVTS::ParameterLayout VocalChainProcessor::createLayout()
     // 3. Problem-frequency EQ
     l.add (bparam ("deqOn", "Problem EQ On", false));
     l.add (fparam ("deqThresh", "Problem EQ Threshold", -60.0f, 0.0f, 0.0f, "dB"));
-    l.add (cparam ("deqRange", "Problem EQ Vocal Range",
+    // Vocal range (top bar): sets the detection ranges of stages 2, 3 and 4.
+    // ID kept as "deqRange" so older sessions and presets still load.
+    l.add (cparam ("deqRange", "Vocal Range",
                    { "Bass/Baritone", "Tenor/Alto", "Mezzo/Soprano" }, 1));   // default Tenor/Alto
 
     // 4. De-esser
     l.add (bparam ("deessOn", "De-esser On", false));
     l.add (fparam ("deessSens", "De-esser Detection", 0.0f, 100.0f, 0.0f, "%", 1.0f));
     l.add (fparam ("deessReduce", "De-esser Reduction", 0.0f, 20.0f, 0.0f, "dB"));
+    l.add (bparam ("deessSolo", "De-esser Solo", false));   // hear only what is being detected
 
     // 5. Pultec EQP-1A style
     l.add (bparam ("pultecOn", "Pultec On", false));
@@ -95,7 +100,7 @@ APVTS::ParameterLayout VocalChainProcessor::createLayout()
     l.add (fparam ("pHighAtten", "High Atten", 0.0f, 10.0f, 0.0f, "", 0.1f));
 
     // Order of stages 5 and 6: false = Pultec then Compressor, true = Compressor then Pultec (default)
-    l.add (bparam ("swap56", "Swap EQ/Comp Order", true));
+    l.add (bparam ("swap56", "Compressor Before EQ", false));   // default: Pultec EQ (6) then Compressor (7)
 
     // 6. Compressor (3:1 / 4:1, fast attack, auto release)
     l.add (bparam ("comp2On", "Compressor On", false));
@@ -121,6 +126,17 @@ APVTS::ParameterLayout VocalChainProcessor::createLayout()
         return std::make_unique<juce::AudioParameterFloat> (juce::ParameterID { id, 1 }, name, r, def,
                                                             juce::AudioParameterFloatAttributes().withLabel ("Hz"));
     };
+    // Reverb (stage 9)
+    l.add (bparam ("reverbOn", "Reverb On", false));
+    l.add (cparam ("revType", "Reverb Type", { "Room", "Hall", "Plate", "Chamber", "Shimmer" }, 2));   // default Plate
+    l.add (fparam ("revMix", "Reverb Mix", 0.0f, 100.0f, 0.0f, "%", 1.0f));
+    // Light compressor between stages 3 and 4: runs in the background (no panel).
+    l.add (bparam ("lightCompOn", "Light Comp On", true));
+    // Warmth & Air (stage 4)
+    l.add (bparam ("colorOn", "Warmth/Air On", false));
+    l.add (fparam ("warmth", "Warmth", 0.0f, 100.0f, 0.0f, "%", 1.0f));
+    l.add (fparam ("air", "Air", 0.0f, 100.0f, 0.0f, "%", 1.0f));
+
     l.add (bparam ("filterOn", "Filter On", false));
     l.add (freqParam ("hpFreq", "High Pass", 20.0f, 1000.0f, 20.0f));
     l.add (freqParam ("lpFreq", "Low Pass", 2000.0f, 20000.0f, 20000.0f));
@@ -137,9 +153,11 @@ VocalChainProcessor::VocalChainProcessor()
     riderOn  = p ("riderOn");  comp1On = p ("comp1On"); deqOn = p ("deqOn"); deessOn = p ("deessOn");
     pultecOn = p ("pultecOn"); comp2On = p ("comp2On"); delayOn = p ("delayOn");
 
-    riderThresh = p ("riderThresh"); riderTarget = p ("riderTarget");
+    riderThresh = p ("riderThresh"); riderTarget = p ("riderTarget"); riderMode = p ("riderMode");
+    deessSolo   = p ("deessSolo");
     comp1Thresh = p ("comp1Thresh");
     deqThresh   = p ("deqThresh");   deqRange    = p ("deqRange");   autoGain = p ("autoGain");
+    bypassParam = dynamic_cast<juce::AudioParameterBool*> (apvts.getParameter ("bypass"));
     swap56      = p ("swap56");      inHpf       = p ("inHpf");
     deessSens   = p ("deessSens"); deessReduce = p ("deessReduce");
 
@@ -151,6 +169,9 @@ VocalChainProcessor::VocalChainProcessor()
     division    = p ("division");    delayMix    = p ("delayMix");    delayDiv = p ("delayDiv");
     tapeOn      = p ("tapeOn");      tapeAmount  = p ("tapeAmount");  tapeOD   = p ("tapeOD");
     filterOn    = p ("filterOn");    hpFreq      = p ("hpFreq");     lpFreq = p ("lpFreq");
+    reverbOn    = p ("reverbOn");    revType     = p ("revType");    revMix = p ("revMix");
+    lightCompOn = p ("lightCompOn");
+    colorOn     = p ("colorOn");     warmth      = p ("warmth");      air = p ("air");
 }
 
 bool VocalChainProcessor::isBusesLayoutSupported (const BusesLayout& layouts) const
@@ -161,11 +182,13 @@ bool VocalChainProcessor::isBusesLayoutSupported (const BusesLayout& layouts) co
     return out == layouts.getMainInputChannelSet();
 }
 
-void VocalChainProcessor::prepareToPlay (double sr, int)
+void VocalChainProcessor::prepareToPlay (double sr, int samplesPerBlock)
 {
     rider.prepare (sr);
     inputHpf.prepare (sr);
     currentRate = sr;
+    dryBuf.setSize (vc::kMaxCh, juce::jmax (samplesPerBlock, 512));   // bypass crossfade (no allocation later)
+    wasBypassed = bypassParam != nullptr && bypassParam->get();
     agIn = agOut = 0.0f; agGainDb = 0.0f;
     compGate.prepare (sr);                   // de-ess + gate, fixed times
     problemEQ.prepare (sr);
@@ -175,6 +198,9 @@ void VocalChainProcessor::prepareToPlay (double sr, int)
     tape.prepare (sr);
     passFilters.prepare (sr);
     delay.prepare (sr);
+    reverb.prepare (sr);
+    lightComp.prepare (sr);
+    warmthAir.prepare (sr);
 }
 
 void VocalChainProcessor::processBlock (juce::AudioBuffer<float>& buffer, juce::MidiBuffer&)
@@ -188,6 +214,23 @@ void VocalChainProcessor::processBlock (juce::AudioBuffer<float>& buffer, juce::
     const int nch = juce::jmin (numIn, vc::kMaxCh);
     const int n   = buffer.getNumSamples();
     if (nch <= 0 || n <= 0) return;
+
+    // Bypass: pass the input straight through (the analyzer shows it as both before and after).
+    // Switching on or off crossfades over one block so it never clicks.
+    const bool bypassNow = bypassParam != nullptr && bypassParam->get();
+    if (bypassNow && wasBypassed)
+    {
+        const float* const* rd = buffer.getArrayOfReadPointers();
+        preTap.push (rd, nch, n);
+        postTap.push (rd, nch, n);
+        return;
+    }
+    const bool bypassFade = bypassNow != wasBypassed;
+    if (bypassFade)
+    {
+        dryBuf.setSize (nch, n, false, false, true);
+        for (int c = 0; c < nch; ++c) dryBuf.copyFrom (c, 0, buffer, c, 0, n);
+    }
 
     auto on = [] (std::atomic<float>* a) { return a->load() > 0.5f; };
 
@@ -214,7 +257,12 @@ void VocalChainProcessor::processBlock (juce::AudioBuffer<float>& buffer, juce::
     static constexpr double kDelayBeats[] = { 0.5, 1.0, 2.0 };
     const float delaySec = (float) (kDelayBeats[juce::jlimit (0, 2, (int) delayDiv->load())] * quarter);
 
-    rider.setTiming (unit);
+    rider.setTiming (unit, juce::jlimit (0, 4, (int) riderMode->load()));
+    lightComp.setRelease (unit);   // background compressor: release = Timing note
+    reverb.setRelease (unit * 0.25);  // reverb swells back up over a quarter of the Timing note
+    reverb.setTempo (quarter);        // pre-delay and length follow the song tempo
+    delay.ducker.setRelease (unit * 0.25);   // delay echoes swell back the same way
+    reverb.setType ((int) revType->load());
 
     // Compressor release: Fast (default) or Slow (4x longer), both program-dependent.
     const double relScale = on (comp2SlowRel) ? 4.0 : 1.0;
@@ -255,6 +303,8 @@ void VocalChainProcessor::processBlock (juce::AudioBuffer<float>& buffer, juce::
     };
 
     // Process in chunks so per-stage measurement needs no allocation.
+    const int vocalRange = juce::jlimit (0, 2, (int) deqRange->load());   // top-bar Vocal Range
+
     for (int start = 0; start < n; start += kChunk)
     {
         const int len = juce::jmin (kChunk, n - start);
@@ -281,7 +331,7 @@ void VocalChainProcessor::processBlock (juce::AudioBuffer<float>& buffer, juce::
         {
             rider.process (ch, nch, len, riderThresh->load(), riderTarget->load());
             stageAct[0] = juce::jmax (stageAct[0], dynAct (rider.meter));
-            // Left bar: how far the level goes over the threshold, full at 12 dB
+            // Left bar: how far the level goes over the noise floor, full at 12 dB
             stageAct2[0] = juce::jmax (stageAct2[0], juce::jlimit (0.0f, 1.0f, rider.overMeter / 12.0f));
             rider.overMeter = 0;
         }
@@ -289,29 +339,52 @@ void VocalChainProcessor::processBlock (juce::AudioBuffer<float>& buffer, juce::
         // 2. Light compressor
         if (on (comp1On))
         {
-            compGate.process (ch, nch, len, comp1Thresh->load());
-            stageAct[1] = juce::jmax (stageAct[1], dynAct (compGate.meter));
+            compGate.setRange (vocalRange);
+            compGate.setTiming (unit);   // gate hold / close follow the Timing note
+            // Threshold = de-ess only. Gate opens at the rider's Noise Floor when the rider is on, else automatic.
+            compGate.process (ch, nch, len, comp1Thresh->load(), on (riderOn), riderThresh->load());
+            stageAct[1]  = juce::jmax (stageAct[1],  dynAct (compGate.meter));       // meter bar: de-esser
+            stageAct2[1] = juce::jmax (stageAct2[1], dynAct (compGate.gateMeter));   // LED: gate
         }
 
         // 3. Problem-frequency EQ
         if (on (deqOn))
         {
-            problemEQ.process (ch, nch, len, deqThresh->load(), (int) deqRange->load());
+            problemEQ.process (ch, nch, len, deqThresh->load(), vocalRange);
             float m = problemEQ.takeMeter();
             stageAct[2] = juce::jmax (stageAct[2], dynAct (m));
         }
 
-        // 4. De-esser
-        if (on (deessOn))
+        // Background light compressor (1.5:1, auto threshold, output matched). No panel.
+        if (on (lightCompOn))
         {
-            deEsser.process (ch, nch, len, deessSens->load(), deessReduce->load());
-            float m = deEsser.takeMeter();
-            stageAct[3] = juce::jmax (stageAct[3], dynAct (m));
-            // Detection: how far the s/sh goes over the threshold, full scale at 12 dB.
-            stageAct2[3] = juce::jmax (stageAct2[3], juce::jlimit (0.0f, 1.0f, deEsser.takeDetectMeter() / 12.0f));
+            lightComp.process (ch, nch, len);
+            lightComp.meter = 0;
         }
 
-        // 5. Pultec
+        // 4. Warmth & Air (tube saturation + harmonic exciter)
+        if (on (colorOn))
+        {
+            warmthAir.setVocalRange (vocalRange);   // lift and air bands follow the top-bar vocal range
+            runStatic (3, ch, nch, len, [&] { warmthAir.process (ch, nch, len, warmth->load(), air->load()); });
+        }
+
+        // 5. De-esser. Solo: output only what is being detected (the S/SH band while it is sibilance), and
+        // skip everything after it so the removed part is heard as-is.
+        const bool soloing = on (deessOn) && on (deessSolo);
+        if (on (deessOn))
+        {
+            deEsser.setRange (vocalRange);
+            deEsser.process (ch, nch, len, deessSens->load(), deessReduce->load(), soloing);
+            float m = deEsser.takeMeter();
+            stageAct[4] = juce::jmax (stageAct[4], dynAct (m));
+            // Detection: how far the s/sh goes over the threshold, full scale at 12 dB.
+            stageAct2[4] = juce::jmax (stageAct2[4], juce::jlimit (0.0f, 1.0f, deEsser.takeDetectMeter() / 12.0f));
+        }
+
+        if (! soloing)
+        {
+        // 6/7. Pultec
         auto runPultec = [&]
         {
             if (! on (pultecOn)) return;
@@ -322,33 +395,46 @@ void VocalChainProcessor::processBlock (juce::AudioBuffer<float>& buffer, juce::
             // Two bars: left = low boost, right = high boost
             float lowDb, highDb;
             pultec.takeMeters (lowDb, highDb, len * nch);
-            stageAct2[4] = juce::jmax (stageAct2[4], changeAct (lowDb));
-            stageAct[4]  = juce::jmax (stageAct[4],  changeAct (highDb));
+            stageAct2[5] = juce::jmax (stageAct2[5], changeAct (lowDb));
+            stageAct[5]  = juce::jmax (stageAct[5],  changeAct (highDb));
         };
 
-        // 6. Compressor (meter shows gain reduction, not makeup)
+        // 6/7. Compressor (meter shows gain reduction, not makeup)
         auto runComp2 = [&]
         {
             if (! on (comp2On)) return;
             comp2.process (ch, nch, len, c2Thresh, c2Ratio, c2Makeup, true);
-            stageAct[5] = juce::jmax (stageAct[5], dynAct (comp2.meter));
+            stageAct[6] = juce::jmax (stageAct[6], dynAct (comp2.meter));
         };
 
-        // Order switch: Comp > EQ (default) or EQ > Comp
+        // Order: Pultec EQ then Compressor (default), or Compressor first when swapped
         if (on (swap56)) { runComp2(); runPultec(); }
         else             { runPultec(); runComp2(); }
 
-        // 7. Tape saturation
+        // 8. Tape saturation
         if (on (tapeOn))
-            runStatic (6, ch, nch, len, [&] { tape.process (ch, nch, len, tapeAmount->load(), on (tapeOD)); });
+            runStatic (7, ch, nch, len, [&] { tape.process (ch, nch, len, tapeAmount->load(), on (tapeOD)); });
 
-        // 8. Delay
+        // 9. Delay
         if (on (delayOn))
-            runStatic (7, ch, nch, len, [&] { delay.process (ch, nch, len, delaySec, delayMix->load() * 0.01f); });
+            runStatic (8, ch, nch, len, [&] { delay.process (ch, nch, len, delaySec, delayMix->load() * 0.01f); });
 
-        // 9. High / low pass
+        // 10. Reverb (ducks under the vocal, swells in the gaps).
+        // Meter: left bar = how much reverb is being added, right bar = how far it is ducked.
+        if (on (reverbOn))
+        {
+            const float duckSoFar = stageAct[9];
+            stageAct[9] = 0.0f;
+            reverb.setVocalRange (vocalRange);   // mid dip follows the top-bar vocal range
+            runStatic (9, ch, nch, len, [&] { reverb.process (ch, nch, len, revMix->load() * 0.01f); });
+            stageAct2[9] = juce::jmax (stageAct2[9], stageAct[9]);   // reverb being added
+            stageAct[9]  = juce::jmax (duckSoFar, juce::jlimit (0.0f, 1.0f, reverb.meter / vc::DuckingReverb::kDuckDb));
+            reverb.meter = 0;
+        }
+
+        // 11. High / low pass
         if (on (filterOn))
-            runStatic (8, ch, nch, len, [&] { passFilters.process (ch, nch, len, hpFreq->load(), lpFreq->load()); });
+            runStatic (10,ch, nch, len, [&] { passFilters.process (ch, nch, len, hpFreq->load(), lpFreq->load()); });
 
         // Auto gain: follow input and output loudness (~1 s average) and trim the
         // output so it matches the input, within +/-18 dB. Holds during silence.
@@ -373,9 +459,27 @@ void VocalChainProcessor::processBlock (juce::AudioBuffer<float>& buffer, juce::
                     for (int i = 0; i < len; ++i)
                         ch[cc][i] *= g0 + (g1 - g0) * (float) (i + 1) / (float) len;
         }
+        } // ! soloing
 
         postTap.push (ch, nch, len);  // "after" for the analyzer
     }
+
+    // Bypass just switched: crossfade processed <-> dry across this block.
+    if (bypassFade)
+    {
+        for (int c = 0; c < nch; ++c)
+        {
+            float* out = buffer.getWritePointer (c);
+            const float* dry = dryBuf.getReadPointer (c);
+            for (int i = 0; i < n; ++i)
+            {
+                const float t = (float) (i + 1) / (float) n;
+                const float wDry = bypassNow ? t : 1.0f - t;
+                out[i] = out[i] * (1.0f - wDry) + dry[i] * wDry;
+            }
+        }
+    }
+    wasBypassed = bypassNow;
 
     // Publish to the display: keep the peak until the editor reads it.
     for (int s = 0; s < kNumStages; ++s)
@@ -428,7 +532,12 @@ bool VocalChainProcessor::loadPreset (int slot)
     auto xml = juce::XmlDocument::parse (presetFile (slot));
     if (xml == nullptr || ! xml->hasTagName (apvts.state.getType())) return false;
     xml->removeAttribute ("presetName");
+
+    // Presets never change the bypass button: keep whatever it is set to now.
+    const bool keepBypass = bypassParam != nullptr && bypassParam->get();
     apvts.replaceState (juce::ValueTree::fromXml (*xml));
+    if (bypassParam != nullptr && bypassParam->get() != keepBypass)
+        bypassParam->setValueNotifyingHost (keepBypass ? 1.0f : 0.0f);
     return true;
 }
 
