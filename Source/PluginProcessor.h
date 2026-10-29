@@ -88,6 +88,7 @@ public:
     juce::String presetName (int slot) const;         // empty if the slot is unused
     bool savePreset (int slot, const juce::String& name);
     bool loadPreset (int slot);
+    void resetToDefaults();                           // "-init-": every setting back to default (bypass untouched)
 
     std::atomic<float> hostBpm { 120.0f };   // project tempo, for display
     static constexpr float kInHpfOffHz = 20.5f;  // input high-pass at/below this = Off

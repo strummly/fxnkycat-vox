@@ -6,9 +6,56 @@ namespace
     const juce::Colour bg       { 0xff15171c };
     const juce::Colour panelBg  { 0xff20232b };
     const juce::Colour edge     { 0xff343844 };
-    const juce::Colour accent   { 0xffe0a64a };
     const juce::Colour textCol  { 0xffe8e6e1 };
     const juce::Colour dimText  { 0xff8f939e };
+
+    // Accent colour (menu next to SAVE). One choice shared by every open copy of the
+    // plugin, saved next to the presets so it is remembered.
+    struct AccentChoice { const char* name; juce::uint32 argb; };
+    const AccentChoice kAccents[] = {
+        { "Gold",   0xffe0a64a },
+        { "Red",    0xffe0544a },
+        { "Blue",   0xff4a9ee0 },
+        { "Green",  0xff5cc46a },
+        { "Purple", 0xffa77be0 },
+    };
+    constexpr int kNumAccents = (int) (sizeof (kAccents) / sizeof (kAccents[0]));
+
+    juce::Colour accent { kAccents[0].argb };
+    int accentIndex = 0;
+    int accentVersion = 0;   // bumps on every change, so open windows know to repaint
+
+    juce::File settingsFile()
+    {
+        return VocalChainProcessor::presetFolder().getParentDirectory().getChildFile ("settings.xml");
+    }
+
+    void setAccent (int index, bool save)
+    {
+        accentIndex = juce::jlimit (0, kNumAccents - 1, index);
+        accent = juce::Colour (kAccents[accentIndex].argb);
+        ++accentVersion;
+        if (save)
+        {
+            juce::XmlElement xml ("FxnkycatVoxSettings");
+            xml.setAttribute ("accent", kAccents[accentIndex].name);
+            settingsFile().getParentDirectory().createDirectory();
+            xml.writeTo (settingsFile());
+        }
+    }
+
+    void loadAccent()
+    {
+        static bool loaded = false;   // once per session; later windows share the current choice
+        if (loaded) return;
+        loaded = true;
+        if (auto xml = juce::XmlDocument::parse (settingsFile()))
+        {
+            const auto name = xml->getStringAttribute ("accent");
+            for (int i = 0; i < kNumAccents; ++i)
+                if (name.equalsIgnoreCase (kAccents[i].name)) { setAccent (i, false); return; }
+        }
+    }
 }
 
 //==============================================================================
@@ -414,6 +461,22 @@ void SpectrumAnalyzer::paint (juce::Graphics& g)
 }
 
 //------------------------------------------------------------------------------
+void ArrowButton::paintButton (juce::Graphics& g, bool highlighted, bool down)
+{
+    auto r = getLocalBounds().toFloat().reduced (1.0f);
+    g.setColour (highlighted ? edge.brighter (0.2f) : edge);
+    g.fillRoundedRectangle (r, 5.0f);
+
+    const auto c = r.getCentre();
+    const float w = 9.0f, h = 5.0f;
+    juce::Path tri;
+    tri.addTriangle (c.x - w * 0.5f, c.y - h * 0.5f + (down ? 1.0f : 0.0f),
+                     c.x + w * 0.5f, c.y - h * 0.5f + (down ? 1.0f : 0.0f),
+                     c.x,            c.y + h * 0.5f + (down ? 1.0f : 0.0f));
+    g.setColour (accent);
+    g.fillPath (tri);
+}
+
 LedButton::LedButton() : juce::Button ({})
 {
     setClickingTogglesState (true);
@@ -648,12 +711,12 @@ void ModulePanel::resized()
 //==============================================================================
 VocalChainEditor::VocalChainEditor (VocalChainProcessor& p)
     : AudioProcessorEditor (p), proc (p),
-      rider     ("1", "Volume Rider",    "Rides to target  |  noise floor  |  5 speeds", 1),
-      comp1     ("2", "Comp-Gate",       "Auto gate  |  threshold sets the de-ess", 1),
+      rider     ("1", "Rider",           "Rides to target  |  noise floor  |  3 speeds", 1),
+      comp1     ("2", "Gate/Pre-Esser",  "Auto gate  |  threshold sets the de-ess", 1),
       problemEQ ("3", "Problem EQ",      "Finds and cuts resonances: low, mid, high", 1),
-      warmAir   ("4", "Warmth / Air",    "Tube warmth  |  harmonic exciter", 2),
+      warmAir   ("4", "Harmonics",       "Tube warmth  |  harmonic exciter", 2),
       deEsser   ("5", "De-Esser",        "Finds the strongest S / SH and cuts it", 1),
-      pultec    ("6", "Pultec EQ",       "EQP-1A style program equalizer", 2),
+      pultec    ("6", "Vintage EQ",      "EQP-1A style program equalizer", 2),
       comp2     ("7", "Compressor",      "Fast attack  |  auto release  |  auto makeup", 1),
       tape      ("8", "Tape",            "Analog tape saturation", 2),
       delay     ("9", "Delay",           "Synced to project tempo", 2),
@@ -674,6 +737,7 @@ VocalChainEditor::VocalChainEditor (VocalChainProcessor& p)
     lnf.setColour (juce::PopupMenu::highlightedBackgroundColourId, accent);
     lnf.setColour (juce::PopupMenu::highlightedTextColourId, bg);
     setLookAndFeel (&lnf);
+    loadAccent();   // saved accent colour (first window of the session)
 
     analyzer.setWatermark (juce::ImageCache::getFromMemory (BinaryData::logo_png, BinaryData::logo_pngSize), "FXNKYCAT VOX");
     // 1. Volume rider: speed mode across the top, then noise floor and target.
@@ -690,8 +754,8 @@ VocalChainEditor::VocalChainEditor (VocalChainProcessor& p)
     comp1.setLedFromSecond (true);   // meter bar: de-esser, LED: gate
     bindEnable (comp1, "comp1On");
 
-    // 4. Warmth & Air: Air on top, Warmth below
-    warmAir.add (knob ("air", "Air"));
+    // 4. Harmonics: Exciter on top, Warmth below
+    warmAir.add (knob ("air", "Exciter"));
     warmAir.add (knob ("warmth", "Warmth"));
     bindEnable (warmAir, "colorOn");
 
@@ -821,19 +885,26 @@ VocalChainEditor::VocalChainEditor (VocalChainProcessor& p)
     saveButton.setColour (juce::TextButton::textColourOffId, accent);
     saveButton.onClick = [this] { showSaveDialog(); };
     addAndMakeVisible (saveButton);
+
+    // Accent colour menu (arrow right of SAVE)
+    colourButton.onClick = [this] { showColourMenu(); };
+    addAndMakeVisible (colourButton);
+    applyAccentColours();
     refreshPresetList();
 
     addAndMakeVisible (analyzer);
 
     // Resizable from the bottom-right corner; panels, knobs and analyzer scale with the window.
     setResizable (true, true);
-    setResizeLimits (1480, 790, 2680, 1600);
-    setSize (1480, 900);
+    setResizeLimits (1510, 790, 2680, 1600);
+    setSize (1510, 900);
     startTimerHz (30);
 }
 
 void VocalChainEditor::timerCallback()
 {
+    if (lastAccentVersion != accentVersion) applyAccentColours();   // another window changed the colour
+
     ui::ModulePanel* panels[VocalChainProcessor::kNumStages] =
         { &rider, &comp1, &problemEQ, &warmAir, &deEsser, &pultec, &comp2, &tape, &delay, &reverb, &filters };
 
@@ -857,6 +928,35 @@ void VocalChainEditor::timerCallback()
         bpmLabel.setText (bpmText, juce::dontSendNotification);
 }
 
+void VocalChainEditor::applyAccentColours()
+{
+    lastAccentVersion = accentVersion;
+    lnf.setColour (juce::Slider::rotarySliderFillColourId, accent);
+    lnf.setColour (juce::ComboBox::arrowColourId, accent);
+    lnf.setColour (juce::PopupMenu::highlightedBackgroundColourId, accent);
+    saveButton.setColour (juce::TextButton::textColourOffId, accent);
+    sendLookAndFeelChange();   // sliders/combos pick up the new look-and-feel colours
+    repaint();                 // everything else reads the accent when it paints
+}
+
+void VocalChainEditor::showColourMenu()
+{
+    juce::PopupMenu m;
+    m.setLookAndFeel (&lnf);
+    m.addSectionHeader ("Accent colour");
+    for (int i = 0; i < kNumAccents; ++i)
+        m.addItem (i + 1, kAccents[i].name, true, i == accentIndex);
+
+    juce::Component::SafePointer<VocalChainEditor> safe (this);
+    m.showMenuAsync (juce::PopupMenu::Options().withTargetComponent (&colourButton),
+                     [safe] (int result)
+                     {
+                         if (safe == nullptr || result <= 0) return;
+                         setAccent (result - 1, true);
+                         safe->applyAccentColours();
+                     });
+}
+
 void VocalChainEditor::applySwap (bool s)
 {
     swapped = s;
@@ -871,6 +971,8 @@ void VocalChainEditor::applySwap (bool s)
 void VocalChainEditor::refreshPresetList (int selectSlot)
 {
     presetBox.clear (juce::dontSendNotification);
+    presetBox.addItem ("-init-", kInitPresetId);   // resets everything to the defaults
+    presetBox.addSeparator();
     for (int s = 0; s < VocalChainProcessor::kNumPresets; ++s)
     {
         const auto name = proc.presetName (s);
@@ -883,6 +985,7 @@ void VocalChainEditor::refreshPresetList (int selectSlot)
 
 void VocalChainEditor::presetChosen()
 {
+    if (presetBox.getSelectedId() == kInitPresetId) { proc.resetToDefaults(); return; }
     const int slot = presetBox.getSelectedId() - 1;
     if (slot >= 0 && ! proc.loadPreset (slot))
         presetBox.setSelectedId (0, juce::dontSendNotification);
@@ -895,7 +998,8 @@ void VocalChainEditor::showSaveDialog()
     w->setLookAndFeel (&lnf);
 
     const int current = presetBox.getSelectedId() - 1;
-    w->addTextEditor ("name", current >= 0 ? proc.presetName (current) : juce::String(), "Preset name:");
+    const bool onSlot = current >= 0 && current < VocalChainProcessor::kNumPresets;   // not on -init-
+    w->addTextEditor ("name", onSlot ? proc.presetName (current) : juce::String(), "Preset name:");
 
     juce::StringArray slots;
     int firstEmpty = -1;
@@ -906,7 +1010,7 @@ void VocalChainEditor::showSaveDialog()
         slots.add ("Slot " + juce::String (s + 1) + (name.isEmpty() ? "  (empty)" : "  (replace \"" + name + "\")"));
     }
     w->addComboBox ("slot", slots, "Save to:");
-    w->getComboBoxComponent ("slot")->setSelectedItemIndex (current >= 0 ? current : juce::jmax (0, firstEmpty));
+    w->getComboBoxComponent ("slot")->setSelectedItemIndex (onSlot ? current : juce::jmax (0, firstEmpty));
 
     w->addButton ("Save", 1, juce::KeyPress (juce::KeyPress::returnKey));
     w->addButton ("Cancel", 0, juce::KeyPress (juce::KeyPress::escapeKey));
@@ -993,6 +1097,8 @@ void VocalChainEditor::resized()
     hdrDivider = { r.getX() + 8, r.getY() - 1, r.getWidth() - 16, 1 };
 
     // One row. Right side (right to left): presets, auto gain, then the 5/6 order switch.
+    colourButton.setBounds (top.removeFromRight (24).withSizeKeepingCentre (24, 28));
+    top.removeFromRight (4);
     saveButton.setBounds (top.removeFromRight (58).withSizeKeepingCentre (58, 28));
     top.removeFromRight (6);
     presetBox.setBounds (top.removeFromRight (170).withSizeKeepingCentre (170, 30));

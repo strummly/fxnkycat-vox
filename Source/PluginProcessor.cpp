@@ -67,7 +67,7 @@ APVTS::ParameterLayout VocalChainProcessor::createLayout()
     l.add (bparam ("riderOn", "Rider On", false));
     l.add (fparam ("riderThresh", "Rider Noise Floor", -60.0f, 0.0f, 0.0f, "dB"));
     l.add (fparam ("riderTarget", "Rider Target", -40.0f, 0.0f, -18.0f, "dB"));
-    l.add (cparam ("riderMode", "Rider Speed", { "Rider", "Leveler", "Fast", "Squash", "Locked" }, 0));
+    l.add (cparam ("riderMode", "Rider Speed", { "Natural", "Balanced", "Fast" }, 0));
 
     // 2. Light compressor (2:1, 1 ms attack, 1/4 note release)
     l.add (bparam ("comp1On", "Comp-Gate On", false));
@@ -133,9 +133,9 @@ APVTS::ParameterLayout VocalChainProcessor::createLayout()
     // Light compressor between stages 3 and 4: runs in the background (no panel).
     l.add (bparam ("lightCompOn", "Light Comp On", true));
     // Warmth & Air (stage 4)
-    l.add (bparam ("colorOn", "Warmth/Air On", false));
+    l.add (bparam ("colorOn", "Harmonics On", false));
     l.add (fparam ("warmth", "Warmth", 0.0f, 100.0f, 0.0f, "%", 1.0f));
-    l.add (fparam ("air", "Air", 0.0f, 100.0f, 0.0f, "%", 1.0f));
+    l.add (fparam ("air", "Exciter", 0.0f, 100.0f, 0.0f, "%", 1.0f));
 
     l.add (bparam ("filterOn", "Filter On", false));
     l.add (freqParam ("hpFreq", "High Pass", 20.0f, 1000.0f, 20.0f));
@@ -257,7 +257,7 @@ void VocalChainProcessor::processBlock (juce::AudioBuffer<float>& buffer, juce::
     static constexpr double kDelayBeats[] = { 0.5, 1.0, 2.0 };
     const float delaySec = (float) (kDelayBeats[juce::jlimit (0, 2, (int) delayDiv->load())] * quarter);
 
-    rider.setTiming (unit, juce::jlimit (0, 4, (int) riderMode->load()));
+    rider.setTiming (unit, juce::jlimit (0, 2, (int) riderMode->load()));   // Natural, Balanced, Fast
     lightComp.setRelease (unit);   // background compressor: release = Timing note
     reverb.setRelease (unit * 0.25);  // reverb swells back up over a quarter of the Timing note
     reverb.setTempo (quarter);        // pre-delay and length follow the song tempo
@@ -539,6 +539,18 @@ bool VocalChainProcessor::loadPreset (int slot)
     if (bypassParam != nullptr && bypassParam->get() != keepBypass)
         bypassParam->setValueNotifyingHost (keepBypass ? 1.0f : 0.0f);
     return true;
+}
+
+void VocalChainProcessor::resetToDefaults()
+{
+    for (auto* prm : getParameters())
+        if (auto* rp = dynamic_cast<juce::RangedAudioParameter*> (prm))
+            if (rp != bypassParam)   // presets never touch bypass
+            {
+                rp->beginChangeGesture();
+                rp->setValueNotifyingHost (rp->getDefaultValue());
+                rp->endChangeGesture();
+            }
 }
 
 juce::AudioProcessorEditor* VocalChainProcessor::createEditor()

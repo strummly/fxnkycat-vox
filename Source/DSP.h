@@ -140,7 +140,7 @@ struct SVF
 };
 
 //==============================================================================
-// 1. Volume rider (vocal rider in the style of NoiseWorks GainAim)
+// 1. Rider (vocal rider in the style of NoiseWorks GainAim)
 // Two parts, both stereo-linked:
 //   - Ride: a loudness average of the singing only (gaps and breaths are left out)
 //     moves the gain so the voice sits at the Target. Its speed comes from the
@@ -149,11 +149,9 @@ struct SVF
 //   - Noise floor: a fast (20 ms) level check. Anything under the floor (breaths,
 //     room noise, bleed) is pulled down by as much as it is under, up to 12 dB.
 // Speed modes:
-//   Rider   - follows phrases (Timing note: 1x average, 1/4x down, 1x up), +/-12 dB
-//   Leveler - slow, evens out sections (4x average, 1x down, 4x up), +/-12 dB
-//   Fast    - follows words (50 ms / 10 ms / 50 ms), +/-12 dB
-//   Squash  - follows syllables (25 ms / 4 ms / 30 ms), +/-18 dB
-//   Locked  - pins the level to the target (12 ms / 2 ms / 12 ms), +/-24 dB
+//   Natural  - follows phrases (Timing note: 1x average, 1/4x down, 1x up), +/-12 dB
+//   Balanced - slow, evens out sections (4x average, 1x down, 4x up), +/-12 dB
+//   Fast     - follows words (50 ms / 10 ms / 50 ms), +/-12 dB
 struct VolumeRider
 {
     static constexpr float kFloorDepthDb = 12.0f;
@@ -186,11 +184,9 @@ struct VolumeRider
         double avg, down, up;
         switch (mode)
         {
-            case 1:  avg = beat * 4.0; down = beat;        up = beat * 4.0; maxRangeDb = 12.0f; break;  // Leveler
+            case 1:  avg = beat * 4.0; down = beat;        up = beat * 4.0; maxRangeDb = 12.0f; break;  // Balanced
             case 2:  avg = 0.050;      down = 0.010;       up = 0.050;      maxRangeDb = 12.0f; break;  // Fast
-            case 3:  avg = 0.025;      down = 0.004;       up = 0.030;      maxRangeDb = 18.0f; break;  // Squash
-            case 4:  avg = 0.012;      down = 0.002;       up = 0.012;      maxRangeDb = 24.0f; break;  // Locked
-            default: avg = beat;       down = beat * 0.25; up = beat;       maxRangeDb = 12.0f; break;  // Rider
+            default: avg = beat;       down = beat * 0.25; up = beat;       maxRangeDb = 12.0f; break;  // Natural
         }
         rmsC  = timeCoef (avg,  fs);
         downC = timeCoef (down, fs);

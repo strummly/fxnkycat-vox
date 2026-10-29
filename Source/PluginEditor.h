@@ -64,6 +64,14 @@ namespace ui
         static juce::Font font();
     };
 
+    // Small down-arrow button (opens a menu).
+    class ArrowButton : public juce::Button
+    {
+    public:
+        ArrowButton() : juce::Button ({}) { setMouseCursor (juce::MouseCursor::PointingHandCursor); }
+        void paintButton (juce::Graphics&, bool highlighted, bool down) override;
+    };
+
     // A round light you click to toggle: dark when off, glowing when on.
     class LedButton : public juce::Button
     {
@@ -211,6 +219,11 @@ private:
     // Presets: 10 user slots
     juce::ComboBox   presetBox;
     juce::TextButton saveButton { "SAVE" };
+    ui::ArrowButton  colourButton;   // opens the accent colour menu
+    int  lastAccentVersion = -1;
+    void applyAccentColours();      // push the current accent into every colour that uses it
+    void showColourMenu();
+    static constexpr int kInitPresetId = 1000;   // "-init-" item in the preset menu
     void refreshPresetList (int selectSlot = -1);
     void presetChosen();
     void showSaveDialog();
