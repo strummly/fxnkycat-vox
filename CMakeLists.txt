@@ -49,13 +49,17 @@ juce_add_binary_data(VocalChainAssets SOURCES Resources/logo.png)
 
 target_sources(VocalChain PRIVATE
     Source/PluginProcessor.cpp
-    Source/PluginEditor.cpp)
+    Source/PluginEditor.cpp
+    Source/PluginInfo.cpp)
 
 target_compile_definitions(VocalChain PUBLIC
     JUCE_WEB_BROWSER=0
     JUCE_USE_CURL=0
     JUCE_VST3_CAN_REPLACE_VST2=0
-    JUCE_DISPLAY_SPLASH_SCREEN=0)
+    JUCE_DISPLAY_SPLASH_SCREEN=0
+    JUCE_PLUGINHOST_VST3=1      # host one external VST3 as an insert
+    JUCE_PLUGINHOST_AU=0
+    JUCE_PLUGINHOST_LADSPA=0)
 
 target_link_libraries(VocalChain
     PRIVATE

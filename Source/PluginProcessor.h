@@ -36,10 +36,20 @@ struct AnalyzerTap
     }
 };
 
-class VocalChainProcessor : public juce::AudioProcessor
+class VocalChainProcessor : public juce::AudioProcessor, private juce::AsyncUpdater
 {
 public:
     AnalyzerTap preTap, postTap;   // input and output of the whole chain
+
+    // ---- External plugin insert (one VST3, after the stage chosen with "insertPos") ----
+    // All of these are for the message thread only.
+    bool loadInsert (const juce::File& file, juce::String& error);   // replaces any loaded plugin
+    void removeInsert();
+    juce::AudioPluginInstance* getInsert() const { return insert.get(); }
+    juce::String insertName() const { return insert != nullptr ? insert->getName() : juce::String(); }
+    juce::StringArray findInstalledVst3s();                          // paths of VST3s in the standard folders
+    std::function<void()> onInsertAboutToChange, onInsertChanged;    // set by the editor (close / refresh its window)
+    static juce::StringArray insertPositionNames();
 
     // How hard each stage is working right now, 0-1 (peak since the editor last read it).
     // Order: rider, comp-gate, problem EQ, warmth/air, de-esser, pultec, compressor, tape, delay, reverb, filters.
@@ -50,10 +60,10 @@ public:
     std::atomic<float> activity2[kNumStages] {};
 
     VocalChainProcessor();
-    ~VocalChainProcessor() override = default;
+    ~VocalChainProcessor() override;
 
     void prepareToPlay (double sampleRate, int samplesPerBlock) override;
-    void releaseResources() override {}
+    void releaseResources() override;
     bool isBusesLayoutSupported (const BusesLayout& layouts) const override;
     void processBlock (juce::AudioBuffer<float>&, juce::MidiBuffer&) override;
 
@@ -96,6 +106,20 @@ public:
 
 private:
     std::atomic<float>* p (const char* id) { return apvts.getRawParameterValue (id); }
+
+    // External plugin insert
+    void handleAsyncUpdate() override;                        // restores the insert saved with a session
+    void prepareInsert (juce::AudioPluginInstance&);
+    void runInsert (float* const* ch, int nch, int len);     // audio thread
+    juce::AudioPluginFormatManager formatManager;
+    std::unique_ptr<juce::AudioPluginInstance> insert;
+    juce::SpinLock insertLock;                               // guards 'insert' between the threads
+    juce::AudioBuffer<float> insertBuf;                      // scratch for the hosted plugin (16 ch x kChunk)
+    juce::MidiBuffer insertMidi;
+    juce::File insertFile;
+    std::unique_ptr<juce::XmlElement> pendingInsert;         // from setStateInformation, loaded on the message thread
+    juce::CriticalSection pendingLock;
+    std::atomic<float> *insertOn = nullptr, *insertPos = nullptr;
 
     // Stage on/off
     std::atomic<float> *riderOn, *comp1On, *deqOn, *deessOn, *pultecOn, *comp2On, *delayOn;

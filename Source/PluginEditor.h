@@ -236,6 +236,23 @@ private:
     std::unique_ptr<ui::SegmentedSwitch> rangeSwitch;
     ui::SpectrumAnalyzer analyzer;
 
+    // External plugin insert strip (top-left of the analyzer) and the hosted plugin's window
+    juce::Label      insertCaption;
+    ui::LedButton    insertLed;                     // insert on/off
+    juce::TextButton insertLoad { "LOAD VST3..." }; // shows the loaded plugin's name
+    juce::TextButton insertOpen { "OPEN" }, insertRemove { "REMOVE" };
+    juce::ComboBox   insertPosBox;                  // which stage it comes after
+    std::unique_ptr<juce::DocumentWindow> insertWindow;
+    std::unique_ptr<juce::FileChooser>    insertChooser;
+    juce::Component::SafePointer<juce::CallOutBox> insertBrowserBox;   // the plugin browser while it is open
+    juce::Component::SafePointer<juce::Component>  insertBrowser;      // its contents (to update makers)
+    std::unique_ptr<juce::Thread> makerThread;                         // reads plugin makers in the background
+    void refreshInsert();
+    void showInsertMenu();
+    void loadInsertFile (const juce::File&);
+    void openInsertWindow();
+    void closeInsertWindow();
+
     std::vector<std::unique_ptr<APVTS::SliderAttachment>>   sliderAtts;
     std::vector<std::unique_ptr<APVTS::ButtonAttachment>>   buttonAtts;
     std::vector<std::unique_ptr<APVTS::ComboBoxAttachment>> comboAtts;

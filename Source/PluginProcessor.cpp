@@ -40,6 +40,156 @@ juce::StringArray VocalChainProcessor::divisionNames()
     return a;
 }
 
+//==============================================================================
+// External plugin insert
+juce::StringArray VocalChainProcessor::insertPositionNames()
+{
+    // By stage name. "After Vintage EQ" / "After Compressor" follow those stages whichever
+    // order COMP/EQ SWAP puts them in. No "after Filters": that is just after the plugin.
+    return { "After Rider", "After Gate/Pre-Esser", "After Problem EQ", "After Harmonics",
+             "After De-Esser", "After Vintage EQ", "After Compressor", "After Tape", "After Delay",
+             "After Reverb" };
+}
+
+VocalChainProcessor::~VocalChainProcessor()
+{
+    cancelPendingUpdate();
+    const juce::SpinLock::ScopedLockType sl (insertLock);
+    insert.reset();
+}
+
+void VocalChainProcessor::releaseResources()
+{
+    const juce::SpinLock::ScopedLockType sl (insertLock);
+    if (insert != nullptr) insert->releaseResources();
+}
+
+void VocalChainProcessor::prepareInsert (juce::AudioPluginInstance& inst)
+{
+    // Stereo in and out on the main buses; any side-chain buses are switched off.
+    inst.disableNonMainBuses();
+    auto lay = inst.getBusesLayout();
+    if (lay.inputBuses.size()  > 0) lay.inputBuses.getReference (0)  = juce::AudioChannelSet::stereo();
+    if (lay.outputBuses.size() > 0) lay.outputBuses.getReference (0) = juce::AudioChannelSet::stereo();
+    inst.setBusesLayout (lay);   // keeps its own layout if it refuses stereo
+    inst.setRateAndBufferSizeDetails (currentRate, kChunk);
+    inst.prepareToPlay (currentRate, kChunk);
+}
+
+bool VocalChainProcessor::loadInsert (const juce::File& chosen, juce::String& error)
+{
+    // A Windows VST3 bundle is a folder; if the file inside it was picked, use the bundle.
+    auto file = chosen;
+    for (auto f = chosen; f.getParentDirectory() != f; f = f.getParentDirectory())
+        if (f.getFileName().equalsIgnoreCase ("Contents") && f.getParentDirectory().hasFileExtension ("vst3"))
+        { file = f.getParentDirectory(); break; }
+
+    juce::OwnedArray<juce::PluginDescription> types;
+    for (auto* fmt : formatManager.getFormats())
+        if (fmt->fileMightContainThisPluginType (file.getFullPathName()))
+            fmt->findAllTypesForFile (types, file.getFullPathName());
+
+    if (types.isEmpty()) { error = "No VST3 plugin was found in:\n" + file.getFullPathName(); return false; }
+    if (types[0]->name.containsIgnoreCase ("fxnkycat vox")) { error = "fxnkycat vox can't be loaded inside itself."; return false; }
+
+    auto inst = formatManager.createPluginInstance (*types[0], currentRate, kChunk, error);
+    if (inst == nullptr) { if (error.isEmpty()) error = "The plugin could not be opened."; return false; }
+    if (inst->getTotalNumOutputChannels() == 0) { error = types[0]->name + " has no audio output."; return false; }
+
+    prepareInsert (*inst);
+
+    if (onInsertAboutToChange) onInsertAboutToChange();   // the editor closes the old plugin's window
+    std::unique_ptr<juce::AudioPluginInstance> old;
+    {
+        const juce::SpinLock::ScopedLockType sl (insertLock);
+        old = std::move (insert);
+        insert = std::move (inst);
+    }
+    if (old != nullptr) old->releaseResources();
+    old.reset();   // destroyed here, on the message thread
+
+    insertFile = file;
+    setLatencySamples (insert->getLatencySamples());     // the DAW compensates the plugin's delay
+    if (onInsertChanged) onInsertChanged();
+    return true;
+}
+
+void VocalChainProcessor::removeInsert()
+{
+    if (insert == nullptr) return;
+    if (onInsertAboutToChange) onInsertAboutToChange();
+    std::unique_ptr<juce::AudioPluginInstance> old;
+    {
+        const juce::SpinLock::ScopedLockType sl (insertLock);
+        old = std::move (insert);
+    }
+    old->releaseResources();
+    old.reset();
+    insertFile = juce::File();
+    setLatencySamples (0);
+    if (onInsertChanged) onInsertChanged();
+}
+
+juce::StringArray VocalChainProcessor::findInstalledVst3s()
+{
+    juce::StringArray found;
+    for (auto* fmt : formatManager.getFormats())
+        found.addArray (fmt->searchPathsForPlugins (fmt->getDefaultLocationsToSearch(), true, false));
+    for (int i = found.size(); --i >= 0;)
+        if (found[i].containsIgnoreCase ("fxnkycat vox")) found.remove (i);   // not ourselves
+    found.sort (true);
+    return found;
+}
+
+void VocalChainProcessor::runInsert (float* const* ch, int nch, int len)
+{
+    // If the message thread is swapping plugins right now, skip this chunk rather than wait.
+    const juce::SpinLock::ScopedTryLockType tl (insertLock);
+    if (! tl.isLocked() || insert == nullptr) return;
+
+    const int pluginCh = juce::jlimit (1, insertBuf.getNumChannels(),
+                                       juce::jmax (insert->getTotalNumInputChannels(), insert->getTotalNumOutputChannels()));
+    for (int c = 0; c < pluginCh; ++c)
+    {
+        if (c < nch)                     std::copy (ch[c], ch[c] + len, insertBuf.getWritePointer (c));
+        else if (c == 1 && nch == 1)     std::copy (ch[0], ch[0] + len, insertBuf.getWritePointer (c));   // mono -> both sides
+        else                             insertBuf.clear (c, 0, len);
+    }
+
+    juce::AudioBuffer<float> view (insertBuf.getArrayOfWritePointers(), pluginCh, len);
+    insertMidi.clear();
+    if (insertOn->load() > 0.5f) insert->processBlock (view, insertMidi);
+    else                         insert->processBlockBypassed (view, insertMidi);
+
+    const int outCh = juce::jmax (1, insert->getTotalNumOutputChannels());
+    for (int c = 0; c < nch; ++c)
+    {
+        const float* src = view.getReadPointer (juce::jmin (c, outCh - 1));   // mono output -> both sides
+        std::copy (src, src + len, ch[c]);
+    }
+}
+
+void VocalChainProcessor::handleAsyncUpdate()
+{
+    std::unique_ptr<juce::XmlElement> xml;
+    {
+        const juce::ScopedLock sl (pendingLock);
+        xml = std::move (pendingInsert);
+    }
+    if (xml == nullptr) return;
+
+    const juce::File file (xml->getStringAttribute ("file"));
+    if (xml->getStringAttribute ("file").isEmpty()) { removeInsert(); return; }
+
+    juce::String error;
+    if (! loadInsert (file, error)) return;   // plugin missing on this computer: leave the slot empty
+
+    juce::MemoryBlock mb;
+    if (mb.fromBase64Encoding (xml->getStringAttribute ("state")) && mb.getSize() > 0)
+        insert->setStateInformation (mb.getData(), (int) mb.getSize());
+    setLatencySamples (insert->getLatencySamples());
+}
+
 APVTS::ParameterLayout VocalChainProcessor::createLayout()
 {
     APVTS::ParameterLayout l;
@@ -59,6 +209,9 @@ APVTS::ParameterLayout VocalChainProcessor::createLayout()
     // Output auto gain: keeps the output about as loud as the input
     l.add (bparam ("autoGain", "Auto Gain", false));
     l.add (bparam ("bypass", "Bypass", false));   // whole plugin; also the DAW's own bypass
+    // External plugin insert: on/off and which stage it comes after
+    l.add (bparam ("insertOn", "Insert On", false));   // switched on when a plugin is added
+    l.add (cparam ("insertPos", "Insert After", insertPositionNames(), 0));   // default: after the Rider
 
     // Global timing note value. Tempo itself comes from the project (host).
     l.add (cparam ("division", "Timing", divisionNames(), 6));   // default 1/4
@@ -158,6 +311,10 @@ VocalChainProcessor::VocalChainProcessor()
     comp1Thresh = p ("comp1Thresh");
     deqThresh   = p ("deqThresh");   deqRange    = p ("deqRange");   autoGain = p ("autoGain");
     bypassParam = dynamic_cast<juce::AudioParameterBool*> (apvts.getParameter ("bypass"));
+    insertOn    = p ("insertOn");    insertPos   = p ("insertPos");
+
+    formatManager.addDefaultFormats();   // VST3 (the only hosting format enabled in the build)
+    insertBuf.setSize (16, kChunk);
     swap56      = p ("swap56");      inHpf       = p ("inHpf");
     deessSens   = p ("deessSens"); deessReduce = p ("deessReduce");
 
@@ -198,6 +355,10 @@ void VocalChainProcessor::prepareToPlay (double sr, int samplesPerBlock)
     tape.prepare (sr);
     passFilters.prepare (sr);
     delay.prepare (sr);
+    {
+        const juce::SpinLock::ScopedLockType sl (insertLock);   // re-prepare the hosted plugin at the new rate
+        if (insert != nullptr) prepareInsert (*insert);
+    }
     reverb.prepare (sr);
     lightComp.prepare (sr);
     warmthAir.prepare (sr);
@@ -260,6 +421,7 @@ void VocalChainProcessor::processBlock (juce::AudioBuffer<float>& buffer, juce::
     rider.setTiming (unit, juce::jlimit (0, 2, (int) riderMode->load()));   // Natural, Balanced, Fast
     lightComp.setRelease (unit);   // background compressor: release = Timing note
     reverb.setRelease (unit * 0.25);  // reverb swells back up over a quarter of the Timing note
+    reverb.setTailTiming (unit);      // tail cleanup: rings 2 x the note after the vocal stops, then fades
     reverb.setTempo (quarter);        // pre-delay and length follow the song tempo
     delay.ducker.setRelease (unit * 0.25);   // delay echoes swell back the same way
     reverb.setType ((int) revType->load());
@@ -304,6 +466,7 @@ void VocalChainProcessor::processBlock (juce::AudioBuffer<float>& buffer, juce::
 
     // Process in chunks so per-stage measurement needs no allocation.
     const int vocalRange = juce::jlimit (0, 2, (int) deqRange->load());   // top-bar Vocal Range
+    const int insAfter   = juce::jlimit (0, 9, (int) insertPos->load());  // external plugin insert position
 
     for (int start = 0; start < n; start += kChunk)
     {
@@ -326,6 +489,9 @@ void VocalChainProcessor::processBlock (juce::AudioBuffer<float>& buffer, juce::
         if (const float hz = inHpf->load(); hz > kInHpfOffHz)
             inputHpf.process (ch, nch, len, hz);
 
+        // External plugin insert: runs right after the stage chosen in "Insert After" (0 = after stage 1).
+        auto insertAfter = [&] (int pos) { if (insAfter == pos) runInsert (ch, nch, len); };
+
         // 1. Volume rider
         if (on (riderOn))
         {
@@ -335,6 +501,7 @@ void VocalChainProcessor::processBlock (juce::AudioBuffer<float>& buffer, juce::
             stageAct2[0] = juce::jmax (stageAct2[0], juce::jlimit (0.0f, 1.0f, rider.overMeter / 12.0f));
             rider.overMeter = 0;
         }
+        insertAfter (0);
 
         // 2. Light compressor
         if (on (comp1On))
@@ -346,6 +513,7 @@ void VocalChainProcessor::processBlock (juce::AudioBuffer<float>& buffer, juce::
             stageAct[1]  = juce::jmax (stageAct[1],  dynAct (compGate.meter));       // meter bar: de-esser
             stageAct2[1] = juce::jmax (stageAct2[1], dynAct (compGate.gateMeter));   // LED: gate
         }
+        insertAfter (1);
 
         // 3. Problem-frequency EQ
         if (on (deqOn))
@@ -354,6 +522,7 @@ void VocalChainProcessor::processBlock (juce::AudioBuffer<float>& buffer, juce::
             float m = problemEQ.takeMeter();
             stageAct[2] = juce::jmax (stageAct[2], dynAct (m));
         }
+        insertAfter (2);
 
         // Background light compressor (1.5:1, auto threshold, output matched). No panel.
         if (on (lightCompOn))
@@ -368,6 +537,7 @@ void VocalChainProcessor::processBlock (juce::AudioBuffer<float>& buffer, juce::
             warmthAir.setVocalRange (vocalRange);   // lift and air bands follow the top-bar vocal range
             runStatic (3, ch, nch, len, [&] { warmthAir.process (ch, nch, len, warmth->load(), air->load()); });
         }
+        insertAfter (3);
 
         // 5. De-esser. Solo: output only what is being detected (the S/SH band while it is sibilance), and
         // skip everything after it so the removed part is heard as-is.
@@ -384,6 +554,7 @@ void VocalChainProcessor::processBlock (juce::AudioBuffer<float>& buffer, juce::
 
         if (! soloing)
         {
+        insertAfter (4);   // after the de-esser (skipped while its Solo is on)
         // 6/7. Pultec
         auto runPultec = [&]
         {
@@ -408,12 +579,13 @@ void VocalChainProcessor::processBlock (juce::AudioBuffer<float>& buffer, juce::
         };
 
         // Order: Pultec EQ then Compressor (default), or Compressor first when swapped
-        if (on (swap56)) { runComp2(); runPultec(); }
-        else             { runPultec(); runComp2(); }
+        if (on (swap56)) { runComp2(); insertAfter (6); runPultec(); insertAfter (5); }
+        else             { runPultec(); insertAfter (5); runComp2(); insertAfter (6); }
 
         // 8. Tape saturation
         if (on (tapeOn))
             runStatic (7, ch, nch, len, [&] { tape.process (ch, nch, len, tapeAmount->load(), on (tapeOD)); });
+        insertAfter (7);
 
         // 9. Delay
         if (on (delayOn))
@@ -421,6 +593,7 @@ void VocalChainProcessor::processBlock (juce::AudioBuffer<float>& buffer, juce::
             delay.setVocalRange (vocalRange);   // echo mid dip follows the top-bar vocal range
             runStatic (8, ch, nch, len, [&] { delay.process (ch, nch, len, delaySec, delayMix->load() * 0.01f); });
         }
+        insertAfter (8);
 
         // 10. Reverb (ducks under the vocal, swells in the gaps).
         // Meter: left bar = how much reverb is being added, right bar = how far it is ducked.
@@ -434,6 +607,7 @@ void VocalChainProcessor::processBlock (juce::AudioBuffer<float>& buffer, juce::
             stageAct[9]  = juce::jmax (duckSoFar, juce::jlimit (0.0f, 1.0f, reverb.meter / vc::DuckingReverb::kDuckDb));
             reverb.meter = 0;
         }
+        insertAfter (9);
 
         // 11. High / low pass
         if (on (filterOn))
@@ -564,14 +738,44 @@ juce::AudioProcessorEditor* VocalChainProcessor::createEditor()
 void VocalChainProcessor::getStateInformation (juce::MemoryBlock& destData)
 {
     if (auto xml = apvts.copyState().createXml())
+    {
+        // The external plugin insert is saved with the session: its file and its own settings.
+        // (Not locked: the plugin is only ever swapped on the message thread, and locking here
+        // would make the audio thread skip the insert while the session saves.)
+        if (insert != nullptr)
+        {
+            auto* ins = xml->createNewChildElement ("INSERT");
+            ins->setAttribute ("file", insertFile.getFullPathName());
+            juce::MemoryBlock mb;
+            insert->getStateInformation (mb);
+            ins->setAttribute ("state", mb.toBase64Encoding());
+        }
         copyXmlToBinary (*xml, destData);
+    }
 }
 
 void VocalChainProcessor::setStateInformation (const void* data, int sizeInBytes)
 {
     if (auto xml = getXmlFromBinary (data, sizeInBytes))
         if (xml->hasTagName (apvts.state.getType()))
+        {
+            // Take the insert out first (it isn't a parameter), then restore it on the message thread.
+            std::unique_ptr<juce::XmlElement> ins;
+            if (auto* child = xml->getChildByName ("INSERT"))
+            {
+                ins = std::make_unique<juce::XmlElement> (*child);
+                xml->removeChildElement (child, true);
+            }
+            else
+                ins = std::make_unique<juce::XmlElement> ("INSERT");   // no insert in this session: empty the slot
+
             apvts.replaceState (juce::ValueTree::fromXml (*xml));
+            {
+                const juce::ScopedLock sl (pendingLock);
+                pendingInsert = std::move (ins);
+            }
+            triggerAsyncUpdate();
+        }
 }
 
 juce::AudioProcessor* JUCE_CALLTYPE createPluginFilter()

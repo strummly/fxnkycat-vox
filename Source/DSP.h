@@ -1017,6 +1017,7 @@ struct VocalDucker
 
     float env = 0, envAtt = 0, envRel = 0, longMs = 0, longC = 0;
     float duckDb = 0, downC = 0, upC = 0;
+    int   quietSamples = 0;   // how long since the vocal last came in (for the reverb tail cleanup)
     double fs = 44100, lastRel = -1;
 
     void prepare (double sampleRate)
@@ -1026,7 +1027,7 @@ struct VocalDucker
         longC  = timeCoef (3.0, fs);
         downC  = timeCoef (0.020, fs);
         lastRel = -1; setRelease (0.125);
-        env = longMs = duckDb = 0;
+        env = longMs = duckDb = 0; quietSamples = 0;
     }
 
     void setRelease (double seconds)
@@ -1046,6 +1047,7 @@ struct VocalDucker
         const float refDb = 10.0f * std::log10 (longMs + 1.0e-12f) + 3.0f;   // RMS -> rough peak
         const bool  vocal = lvlDb > -55.0f && lvlDb > refDb - 18.0f;
         duckDb = follow (duckDb, vocal ? -depthDb : 0.0f, upC, downC);
+        quietSamples = vocal ? 0 : std::min (quietSamples + 1, 1 << 30);
         return duckDb;
     }
 };
@@ -1513,10 +1515,23 @@ struct DuckingReverb
         psPos = 0; psPhase = 0; prevOut = 0;
         ducker.prepare (fs);
         lastMix = 0;
+        tailDb = 0; tailBackC = timeCoef (0.020, fs); setTailTiming (0.5);
         type = -1; appliedQuarter = -1; setType (2);
     }
 
     void setRelease (double seconds) { ducker.setRelease (seconds); }
+
+    // Tail cleanup (automatic, from the Timing note): after the vocal stops, the tail
+    // rings out for 2 x the note, then fades a further 24 dB over another 2 x the note.
+    // A new phrase resets it at once.
+    static constexpr float kCleanupDb = 24.0f;
+    int   tailHold = 1, tailFade = 1;
+    float tailDb = 0, tailBackC = 0;
+    void setTailTiming (double unit)
+    {
+        tailHold = std::max (1, (int) (2.0 * unit * fs));
+        tailFade = std::max (1, (int) (2.0 * unit * fs));
+    }
 
     // Song tempo (one 1/4 note in seconds): re-tunes pre-delay and length when it moves.
     void setTempo (double quarterSeconds)
@@ -1573,6 +1588,12 @@ struct DuckingReverb
 
             // --- Ducking: is the vocal coming in right now? ---
             const float duckDb = ducker.process (x);
+            {
+                const int q = ducker.quietSamples;
+                const float target = q <= tailHold ? 0.0f
+                                   : -kCleanupDb * std::min (1.0f, (float) (q - tailHold) / (float) tailFade);
+                tailDb = target > tailDb ? tailBackC * tailDb + (1.0f - tailBackC) * target : target;   // fade follows the ramp; reset quickly
+            }
             meter = std::max (meter, -duckDb);
 
             // --- Pre-delay ---
@@ -1625,7 +1646,7 @@ struct DuckingReverb
             prevOut = mid;
 
             const float m = mix0 + (mix - mix0) * (float) (i + 1) / (float) n;
-            const float g = m * kWetGain * dbToGain (duckDb);
+            const float g = m * kWetGain * dbToGain (duckDb + tailDb);
             auto filt = [&] (float v, int c) { return wetDip.process (wetLp.process (wetHp.process (v, c), c), c); };
             if (nch > 1)
             {

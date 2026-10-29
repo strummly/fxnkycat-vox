@@ -1,5 +1,7 @@
 #include "PluginEditor.h"
 #include "BinaryData.h"
+#include "PluginInfo.h"
+#include <map>
 
 namespace
 {
@@ -435,8 +437,9 @@ void SpectrumAnalyzer::paint (juce::Graphics& g)
         g.setColour (edge.withAlpha (0.7f));
         g.drawHorizontalLine ((int) y, a.getX(), a.getRight());
         g.setColour (dimText);
-        g.drawText (juce::String ((int) db), juce::Rectangle<float> (a.getX() - 34.0f, y - 7.0f, 30.0f, 14.0f),
-                    juce::Justification::centredRight);
+        if (db < kMaxDb)   // the 0 dB label would sit under the insert strip
+            g.drawText (juce::String ((int) db), juce::Rectangle<float> (a.getX() - 34.0f, y - 7.0f, 30.0f, 14.0f),
+                        juce::Justification::centredRight);
     }
 
     g.saveState();
@@ -885,8 +888,8 @@ VocalChainEditor::VocalChainEditor (VocalChainProcessor& p)
     addAndMakeVisible (bypassButton);
 
     // Presets: pick a slot to load it; SAVE stores the current settings in a slot.
-    presetBox.setTextWhenNothingSelected ("Choose preset...");
-    presetBox.setTextWhenNoChoicesAvailable ("No presets");
+    presetBox.setTextWhenNothingSelected ("CHOOSE PRESET...");
+    presetBox.setTextWhenNoChoicesAvailable ("NO PRESETS");
     presetBox.onChange = [this] { presetChosen(); };
     addAndMakeVisible (presetBox);
     saveButton.setColour (juce::TextButton::buttonColourId, edge);
@@ -901,6 +904,30 @@ VocalChainEditor::VocalChainEditor (VocalChainProcessor& p)
     refreshPresetList();
 
     addAndMakeVisible (analyzer);
+
+    // External plugin insert strip, drawn over the top-left of the analyzer
+    insertCaption.setText ("INSERT", juce::dontSendNotification);
+    insertCaption.setFont (juce::FontOptions (12.0f, juce::Font::bold));
+    insertCaption.setColour (juce::Label::textColourId, dimText);
+    insertCaption.setJustificationType (juce::Justification::centredRight);
+    buttonAtts.push_back (std::make_unique<APVTS::ButtonAttachment> (proc.apvts, "insertOn", insertLed));
+    for (auto* b : { &insertLoad, &insertOpen, &insertRemove })
+    {
+        b->setColour (juce::TextButton::buttonColourId, edge);
+        b->setColour (juce::TextButton::textColourOffId, textCol);
+    }
+    insertLoad.onClick   = [this] { showInsertMenu(); };
+    insertOpen.onClick   = [this] { openInsertWindow(); };
+    insertRemove.onClick = [this] { proc.removeInsert(); };
+    insertPosBox.addItemList (allCaps (VocalChainProcessor::insertPositionNames()), 1);
+    insertPosBox.setJustificationType (juce::Justification::centred);
+    comboAtts.push_back (std::make_unique<APVTS::ComboBoxAttachment> (proc.apvts, "insertPos", insertPosBox));
+    for (auto* c : std::initializer_list<juce::Component*> { &insertCaption, &insertLed, &insertLoad, &insertOpen, &insertRemove, &insertPosBox })
+        addAndMakeVisible (*c);   // added after the analyzer, so they sit on top of it
+
+    proc.onInsertAboutToChange = [this] { closeInsertWindow(); };   // never leave a window on a deleted plugin
+    proc.onInsertChanged       = [this] { refreshInsert(); };
+    refreshInsert();
 
     // Resizable from the bottom-right corner; panels, knobs and analyzer scale with the window.
     setResizable (true, true);
@@ -934,6 +961,400 @@ void VocalChainEditor::timerCallback()
     const auto bpmText = juce::String (proc.hostBpm.load(), 1) + " BPM";
     if (bpmLabel.getText() != bpmText)
         bpmLabel.setText (bpmText, juce::dontSendNotification);
+}
+
+//------------------------------------------------------------------------------
+// External plugin insert
+namespace
+{
+    // Window that shows the hosted plugin's own controls.
+    class InsertWindow : public juce::DocumentWindow
+    {
+    public:
+        InsertWindow (const juce::String& name, std::function<void()> onClose)
+            : juce::DocumentWindow (name, bg, juce::DocumentWindow::closeButton), closeFn (std::move (onClose))
+        {
+            setUsingNativeTitleBar (true);
+        }
+        void closeButtonPressed() override { if (closeFn) closeFn(); }
+    private:
+        std::function<void()> closeFn;
+    };
+
+    // Plugin browser for the LOAD button: search box, A-Z / MAKER sort, list, BROWSE...
+    // Click a plugin to load it. Shown in a call-out under the LOAD button.
+    class InsertBrowser : public juce::Component, private juce::ListBoxModel, private juce::TextEditor::Listener
+    {
+    public:
+        struct Entry { juce::String path, name, maker; };
+
+        InsertBrowser (std::vector<Entry> entries, std::function<void (const juce::File&)> pick, std::function<void()> browseFn)
+            : all (std::move (entries)), onPick (std::move (pick)), onBrowse (std::move (browseFn))
+        {
+            search.setTextToShowWhenEmpty ("SEARCH...", dimText);
+            search.setColour (juce::TextEditor::backgroundColourId, bg);
+            search.setColour (juce::TextEditor::outlineColourId, edge);
+            search.setColour (juce::TextEditor::focusedOutlineColourId, accent);
+            search.setColour (juce::TextEditor::textColourId, textCol);
+            search.setFont (juce::FontOptions (14.0f));
+            search.addListener (this);
+            addAndMakeVisible (search);
+
+            for (auto* b : { &sortAZ, &sortMaker, &browse })
+            {
+                b->setColour (juce::TextButton::buttonColourId, edge);
+                b->setColour (juce::TextButton::buttonOnColourId, accent);
+                b->setColour (juce::TextButton::textColourOffId, textCol);
+                b->setColour (juce::TextButton::textColourOnId, bg);
+                addAndMakeVisible (*b);
+            }
+            sortAZ.setClickingTogglesState (true);    sortAZ.setRadioGroupId (1);
+            sortMaker.setClickingTogglesState (true); sortMaker.setRadioGroupId (1);
+            (byMaker ? sortMaker : sortAZ).setToggleState (true, juce::dontSendNotification);
+            sortAZ.onClick    = [this] { byMaker = false; refilter(); };
+            sortMaker.onClick = [this] { byMaker = true;  refilter(); };
+            browse.onClick    = [this] { auto fn = onBrowse; dismiss(); if (fn) fn(); };
+
+            list.setModel (this);
+            list.setRowHeight (24);
+            list.setColour (juce::ListBox::backgroundColourId, panelBg);
+            list.setColour (juce::ListBox::outlineColourId, edge);
+            list.setOutlineThickness (1);
+            addAndMakeVisible (list);
+
+            refilter();
+            setSize (480, 440);
+        }
+
+        void visibilityChanged() override { if (isShowing()) search.grabKeyboardFocus(); }
+
+        void resized() override
+        {
+            auto r = getLocalBounds().reduced (8);
+            auto top = r.removeFromTop (28);
+            sortMaker.setBounds (top.removeFromRight (70));
+            top.removeFromRight (4);
+            sortAZ.setBounds (top.removeFromRight (50));
+            top.removeFromRight (8);
+            search.setBounds (top);
+            r.removeFromTop (6);
+            browse.setBounds (r.removeFromBottom (28).removeFromRight (110));
+            r.removeFromBottom (6);
+            list.setBounds (r);
+        }
+
+        void paint (juce::Graphics& g) override
+        {
+            g.fillAll (panelBg);
+            if (reading)
+            {
+                g.setColour (dimText);
+                g.setFont (juce::FontOptions (12.0f));
+                g.drawText ("READING MAKERS...", getLocalBounds().reduced (10, 8).removeFromBottom (28),
+                            juce::Justification::centredLeft, false);
+            }
+        }
+
+        // Makers arrive from the background reader: update them, keeping the search and selection.
+        std::function<juce::String (const juce::String&)> makerOf;
+        void refreshMakers (bool stillReading)
+        {
+            reading = stillReading;
+            if (makerOf) for (auto& e : all) e.maker = makerOf (e.path);
+            refilter();
+            repaint();
+        }
+        bool reading = false;
+
+    private:
+        static inline bool byMaker = false;   // remembered between openings
+
+        int getNumRows() override { return (int) shown.size(); }
+
+        void paintListBoxItem (int row, juce::Graphics& g, int w, int h, bool selected) override
+        {
+            if (row < 0 || row >= (int) shown.size()) return;
+            const auto& e = shown[(size_t) row];
+            if (selected) { g.setColour (accent.withAlpha (0.25f)); g.fillRect (0, 0, w, h); }
+            const int makerW = w * 2 / 5;
+            g.setFont (juce::FontOptions (13.0f, juce::Font::bold));
+            g.setColour (selected ? accent : textCol);
+            g.drawText (e.name.toUpperCase(), 10, 0, w - makerW - 16, h, juce::Justification::centredLeft, true);
+            g.setFont (juce::FontOptions (12.0f));
+            g.setColour (dimText);
+            g.drawText (e.maker.isEmpty() ? juce::String ("-") : e.maker.toUpperCase(), w - makerW, 0, makerW - 10, h,
+                        juce::Justification::centredRight, true);
+        }
+
+        void listBoxItemClicked (int row, const juce::MouseEvent&) override { pickRow (row); }
+        void selectedRowsChanged (int row) override
+        {
+            if (row >= 0 && row < (int) shown.size()) selectedPath = shown[(size_t) row].path;
+        }
+        void returnKeyPressed (int row) override { pickRow (row); }
+        void textEditorTextChanged (juce::TextEditor&) override { refilter(); }
+        void textEditorReturnKeyPressed (juce::TextEditor&) override { pickRow (list.getSelectedRow() >= 0 ? list.getSelectedRow() : 0); }
+
+        void pickRow (int row)
+        {
+            if (row < 0 || row >= (int) shown.size()) return;
+            const juce::File f (shown[(size_t) row].path);
+            auto fn = onPick;
+            dismiss();
+            if (fn) fn (f);
+        }
+
+        void dismiss()
+        {
+            if (auto* box = findParentComponentOfClass<juce::CallOutBox>())
+                box->dismiss();
+        }
+
+        void refilter()
+        {
+            // Every word typed must appear in the name or the maker.
+            const auto words = juce::StringArray::fromTokens (search.getText().trim(), " ", {});
+            shown.clear();
+            for (const auto& e : all)
+            {
+                bool match = true;
+                for (const auto& w : words)
+                    if (! e.name.containsIgnoreCase (w) && ! e.maker.containsIgnoreCase (w)) { match = false; break; }
+                if (match) shown.push_back (e);
+            }
+            std::sort (shown.begin(), shown.end(), [] (const Entry& a, const Entry& b)
+            {
+                if (byMaker)
+                {
+                    // Plugins without a known maker go last.
+                    if (a.maker.isEmpty() != b.maker.isEmpty()) return b.maker.isEmpty();
+                    const int c = a.maker.compareIgnoreCase (b.maker);
+                    if (c != 0) return c < 0;
+                }
+                return a.name.compareIgnoreCase (b.name) < 0;
+            });
+            list.updateContent();
+            int sel = 0;
+            for (size_t i = 0; i < shown.size(); ++i)
+                if (shown[i].path == selectedPath) { sel = (int) i; break; }
+            list.selectRow (shown.empty() ? -1 : sel);
+            if (! shown.empty()) selectedPath = shown[(size_t) sel].path;
+            list.repaint();
+        }
+
+        std::vector<Entry> all, shown;
+        juce::String selectedPath;
+        std::function<void (const juce::File&)> onPick;
+        std::function<void()> onBrowse;
+        juce::TextEditor search;
+        juce::TextButton sortAZ { "A-Z" }, sortMaker { "MAKER" }, browse { "BROWSE..." };
+        juce::ListBox list;
+    };
+
+    // Plugin makers, remembered in a small file next to the presets (path + date -> maker),
+    // so they are only read once per plugin. Reading is slow (Windows scans each plugin
+    // file), so it happens on a background thread while the list is already open.
+    struct MakerCache
+    {
+        juce::CriticalSection lock;
+        std::map<juce::String, std::pair<juce::int64, juce::String>> map;   // path -> (modified time, maker)
+        bool loaded = false;
+
+        static juce::File file() { return settingsFile().getSiblingFile ("plugin-makers.xml"); }
+
+        void load()
+        {
+            const juce::ScopedLock sl (lock);
+            if (loaded) return;
+            loaded = true;
+            if (auto xml = juce::XmlDocument::parse (file()))
+                for (auto* e : xml->getChildIterator())
+                    map[e->getStringAttribute ("path")] = { e->getStringAttribute ("time").getLargeIntValue(),
+                                                            e->getStringAttribute ("maker") };
+        }
+
+        void save()
+        {
+            juce::XmlElement xml ("PluginMakers");
+            {
+                const juce::ScopedLock sl (lock);
+                for (auto& [path, v] : map)
+                {
+                    auto* e = xml.createNewChildElement ("P");
+                    e->setAttribute ("path", path);
+                    e->setAttribute ("time", juce::String (v.first));
+                    e->setAttribute ("maker", v.second);
+                }
+            }
+            file().getParentDirectory().createDirectory();
+            xml.writeTo (file());
+        }
+
+        // true if known (and the plugin hasn't changed since)
+        bool lookup (const juce::String& path, juce::String& maker)
+        {
+            const auto t = juce::File (path).getLastModificationTime().toMilliseconds();
+            const juce::ScopedLock sl (lock);
+            auto it = map.find (path);
+            if (it == map.end() || it->second.first != t) return false;
+            maker = it->second.second;
+            return true;
+        }
+
+        void store (const juce::String& path, const juce::String& maker)
+        {
+            const auto t = juce::File (path).getLastModificationTime().toMilliseconds();
+            const juce::ScopedLock sl (lock);
+            map[path] = { t, maker };
+        }
+    };
+
+    MakerCache& makers()
+    {
+        static MakerCache c;
+        return c;
+    }
+
+    // Reads the makers that aren't known yet, reporting progress on the message thread.
+    class MakerScanThread : public juce::Thread
+    {
+    public:
+        MakerScanThread (juce::StringArray todo, std::function<void (bool finished)> progress)
+            : juce::Thread ("fxnkycat vox plugin makers"), paths (std::move (todo)), onProgress (std::move (progress)) {}
+
+        void run() override
+        {
+            int n = 0;
+            for (const auto& path : paths)
+            {
+                if (threadShouldExit()) return;
+                makers().store (path, vc::vst3Maker (juce::File (path)));
+                if (++n % 8 == 0) onProgress (false);
+            }
+            if (! threadShouldExit()) onProgress (true);
+        }
+
+    private:
+        juce::StringArray paths;
+        std::function<void (bool)> onProgress;
+    };
+}
+
+void VocalChainEditor::refreshInsert()
+{
+    const auto name = proc.insertName();
+    insertLoad.setButtonText (name.isEmpty() ? "LOAD VST3..." : name.toUpperCase());
+    insertOpen.setEnabled (name.isNotEmpty());
+    insertRemove.setEnabled (name.isNotEmpty());
+}
+
+void VocalChainEditor::showInsertMenu()
+{
+    // The VST3s installed in the standard folders, with their makers (read from the
+    // plugins' files, not by loading them; remembered after the first time).
+    makers().load();
+    std::vector<InsertBrowser::Entry> entries;
+    juce::StringArray unknown;
+    for (const auto& path : proc.findInstalledVst3s())
+    {
+        juce::String maker;
+        if (! makers().lookup (path, maker)) unknown.add (path);   // read in the background below
+        entries.push_back ({ path, juce::File (path).getFileNameWithoutExtension(), maker });
+    }
+
+    juce::Component::SafePointer<VocalChainEditor> safe (this);
+    auto browser = std::make_unique<InsertBrowser> (std::move (entries),
+        [safe] (const juce::File& f)
+        {
+            // Load after the call-out has closed.
+            juce::MessageManager::callAsync ([safe, f] { if (safe != nullptr) safe->loadInsertFile (f); });
+        },
+        [safe]
+        {
+            juce::MessageManager::callAsync ([safe]
+            {
+                if (safe == nullptr) return;
+                // Browse for any .vst3, starting in the standard VST3 folder
+                auto start = juce::File::getSpecialLocation (juce::File::globalApplicationsDirectory);
+               #if JUCE_WINDOWS
+                start = juce::File ("C:\\Program Files\\Common Files\\VST3");
+               #elif JUCE_MAC
+                start = juce::File ("/Library/Audio/Plug-Ins/VST3");
+               #endif
+                safe->insertChooser = std::make_unique<juce::FileChooser> ("Choose a VST3 plugin", start, "*.vst3");
+                safe->insertChooser->launchAsync (juce::FileBrowserComponent::openMode | juce::FileBrowserComponent::canSelectFiles,
+                                                  [safe] (const juce::FileChooser& fc)
+                                                  {
+                                                      if (safe != nullptr && fc.getResult() != juce::File())
+                                                          safe->loadInsertFile (fc.getResult());
+                                                  });
+            });
+        });
+    browser->setLookAndFeel (&lnf);
+    browser->makerOf = [] (const juce::String& path) { juce::String m; makers().lookup (path, m); return m; };
+    browser->reading = ! unknown.isEmpty();
+    auto* browserPtr = browser.get();
+    auto& box = juce::CallOutBox::launchAsynchronously (std::move (browser), insertLoad.getBounds(), this);
+    box.setLookAndFeel (&lnf);
+    insertBrowserBox = &box;   // closed with the window if still open
+    insertBrowser = browserPtr;
+
+    // Read the makers we don't know yet, without blocking (Windows scans each plugin file).
+    if (! unknown.isEmpty() && (makerThread == nullptr || ! makerThread->isThreadRunning()))
+    {
+        juce::Component::SafePointer<VocalChainEditor> safeEd (this);
+        makerThread = std::make_unique<MakerScanThread> (unknown, [safeEd] (bool finished)
+        {
+            juce::MessageManager::callAsync ([safeEd, finished]
+            {
+                if (finished) makers().save();
+                if (safeEd == nullptr) return;
+                if (auto* b = dynamic_cast<InsertBrowser*> (safeEd->insertBrowser.getComponent()))
+                    b->refreshMakers (! finished);
+            });
+        });
+        makerThread->startThread (juce::Thread::Priority::low);
+    }
+}
+
+void VocalChainEditor::loadInsertFile (const juce::File& file)
+{
+    juce::String error;
+    if (proc.loadInsert (file, error))
+    {
+        if (auto* prm = proc.apvts.getParameter ("insertOn"))   // adding a plugin switches the insert on
+            prm->setValueNotifyingHost (1.0f);
+        openInsertWindow();   // show the new plugin straight away
+    }
+    else
+        juce::AlertWindow::showMessageBoxAsync (juce::MessageBoxIconType::WarningIcon, "Couldn't load the plugin", error, "OK", this);
+}
+
+void VocalChainEditor::openInsertWindow()
+{
+    auto* inst = proc.getInsert();
+    if (inst == nullptr) return;
+    if (insertWindow != nullptr) { insertWindow->toFront (true); return; }
+
+    juce::AudioProcessorEditor* ed = inst->hasEditor() ? inst->createEditorIfNeeded() : nullptr;
+    if (ed == nullptr) ed = new juce::GenericAudioProcessorEditor (*inst);   // plugins without their own window
+
+    juce::Component::SafePointer<VocalChainEditor> safe (this);
+    auto w = std::make_unique<InsertWindow> (inst->getName(), [safe]
+    {
+        // Close after the click has finished, not inside the window's own callback.
+        juce::MessageManager::callAsync ([safe] { if (safe != nullptr) safe->closeInsertWindow(); });
+    });
+    w->setContentOwned (ed, true);
+    w->setResizable (ed->isResizable(), false);
+    w->centreAroundComponent (this, w->getWidth(), w->getHeight());
+    w->setVisible (true);
+    insertWindow = std::move (w);
+}
+
+void VocalChainEditor::closeInsertWindow()
+{
+    insertWindow.reset();   // deletes the hosted plugin's editor too
 }
 
 void VocalChainEditor::applyAccentColours()
@@ -1040,6 +1461,22 @@ void VocalChainEditor::showSaveDialog()
 VocalChainEditor::~VocalChainEditor()
 {
     stopTimer();
+    proc.onInsertAboutToChange = nullptr;
+    proc.onInsertChanged = nullptr;
+    closeInsertWindow();
+    // Close the plugin browser if it is still open. JUCE's pop-up system owns and deletes it,
+    // so dismiss it rather than deleting it here (and stop it using this window's look-and-feel).
+    if (auto* box = insertBrowserBox.getComponent())
+    {
+        if (auto* b = insertBrowser.getComponent()) b->setLookAndFeel (nullptr);
+        box->setLookAndFeel (nullptr);
+        box->exitModalState (0);
+    }
+    if (makerThread != nullptr)
+    {
+        makerThread->stopThread (4000);        // stop reading makers; keep what was read
+        makers().save();
+    }
     sliderAtts.clear();
     buttonAtts.clear();
     comboAtts.clear();
@@ -1139,6 +1576,20 @@ void VocalChainEditor::resized()
     r.removeFromBottom (8);
 
     analyzer.setBounds (r.removeFromTop (r.getHeight() * 30 / 100));
+    {
+        // Insert strip over the analyzer's top-left corner
+        auto strip = analyzer.getBounds().reduced (16, 10).removeFromTop (26);
+        insertCaption.setBounds (strip.removeFromLeft (54));
+        insertLed.setBounds (strip.removeFromLeft (26).withSizeKeepingCentre (26, 26));
+        strip.removeFromLeft (6);
+        insertLoad.setBounds (strip.removeFromLeft (210));
+        strip.removeFromLeft (4);
+        insertOpen.setBounds (strip.removeFromLeft (56));
+        strip.removeFromLeft (4);
+        insertRemove.setBounds (strip.removeFromLeft (74));
+        strip.removeFromLeft (8);
+        insertPosBox.setBounds (strip.removeFromLeft (200));
+    }
 
     auto row1 = r.removeFromTop (r.getHeight() / 2 - 20);
     const int w1 = row1.getWidth();
