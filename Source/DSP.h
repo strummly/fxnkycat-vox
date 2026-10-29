@@ -1055,10 +1055,24 @@ struct VocalDucker
 // and run at full level; 'mix' crossfades dry -> wet (equal-power, 0 = dry only).
 // The echoes duck 3 dB under the vocal (shared ducker design, the reverb ducks 12) and
 // swell back in the gaps; they keep repeating underneath, only their level dips.
+// The echoes you hear also get a gentle -1 dB mid dip at 1.5 / 2.1 / 3 kHz (by vocal
+// range, same centres as the reverb's dip) so they sit behind the voice's presence.
 struct TempoDelay
 {
     VocalDucker ducker;
     float duckMeter = 0;   // how far the echoes are ducked (dB), largest since last read
+
+    Biquad dip;            // -1 dB mid dip on the echoes you hear (not in the feedback loop)
+    static constexpr double kDipHz[3] = { 1500.0, 2100.0, 3000.0 };   // bass/baritone, tenor/alto, mezzo/soprano
+    int dipRange = -1;
+
+    void setVocalRange (int r)
+    {
+        r = std::clamp (r, 0, 2);
+        if (r == dipRange) return;
+        dipRange = r;
+        dip.makePeak (fs, kDipHz[r], 1.0, -1.0);   // broad (Q 1), like the reverb's dip
+    }
     static constexpr float  kFeedback   = 0.35f;
     static constexpr double kMaxSeconds = 12.0;   // 2 bars of 4/4 at 40 BPM
 
@@ -1081,6 +1095,7 @@ struct TempoDelay
         for (int c = 0; c < kMaxCh; ++c) lp[c] = hp[c] = 0;
         ducker.prepare (fs);
         ducker.depthDb = 3.0f;   // much lighter than the reverb, so the echoes stay clearly audible
+        dip.reset(); dipRange = -1; setVocalRange (1);
     }
 
     void process (float* const* ch, int nch, int n, float delaySeconds, float mix)
@@ -1119,7 +1134,7 @@ struct TempoDelay
 
                 const float x = ch[c][i];
                 b[(size_t) writePos] = x + wet * kFeedback;   // repeats keep going at full level...
-                ch[c][i] = x * dryG + wet * duckG;            // ...only what you hear is ducked
+                ch[c][i] = x * dryG + dip.process (wet, c) * duckG;   // ...only what you hear is ducked and dipped
             }
             writePos = (writePos + 1) % size;
         }
@@ -1401,11 +1416,11 @@ struct WarmthAir
 // vocal is not filtered.
 // Types (in switch order):
 // Pre-delay and length follow the song tempo (see kTypes), e.g. at 120 BPM:
-//   Room    - small, darker, ~8 ms pre-delay (1/256 note), ~1 s (2 beats)
-//   Hall    - big, ~31 ms (1/64 note), ~3 s (6 beats)
-//   Plate   - dense and bright, ~16 ms (1/128 note), ~2.5 s (5 beats)
-//   Chamber - large and smooth, ~23 ms (3/256 note), ~2 s (4 beats)
-//   Shimmer - long hall, ~31 ms (1/64 note), ~4 s (8 beats), with an octave-up
+//   Room    - small, darker, ~8 ms pre-delay (1/256 note), ~0.85 s (1.7 beats)
+//   Hall    - big, ~31 ms (1/64 note), ~2.55 s (5.1 beats)
+//   Plate   - dense and bright, ~16 ms (1/128 note), ~2.1 s (4.25 beats)
+//   Chamber - large and smooth, ~23 ms (3/256 note), ~1.7 s (3.4 beats)
+//   Shimmer - long hall, ~31 ms (1/64 note), ~3.4 s (6.8 beats), with an octave-up
 //             copy of the tail fed back in, so it blooms upward
 // Ducking (VocalDucker, same as the delay): -12 dB while the vocal is coming in,
 // swelling back in the gaps, so the tail fills them and the vocal stays clear.
@@ -1419,11 +1434,11 @@ struct DuckingReverb
     struct Type { float preNote, size, lenBeats, baseRt60, dampHz, diffusion, width, shimmer; };
     static constexpr int kNumTypes = 5;
     static constexpr Type kTypes[kNumTypes] = {
-        { 1.0f / 64.0f, 0.40f, 2.0f, 1.1f, 5000.0f, 0.60f, 0.8f, 0.0f  },   // room    - 1/256 note, 2 beats
-        { 1.0f / 16.0f, 1.00f, 6.0f, 3.2f, 7000.0f, 0.72f, 1.0f, 0.0f  },   // hall    - 1/64 note,  6 beats
-        { 1.0f / 32.0f, 0.65f, 5.0f, 2.8f, 9000.0f, 0.75f, 1.0f, 0.0f  },   // plate   - 1/128 note, 5 beats
-        { 3.0f / 64.0f, 0.90f, 4.0f, 2.2f, 6500.0f, 0.70f, 1.0f, 0.0f  },   // chamber - 3/256 note, 4 beats
-        { 1.0f / 16.0f, 1.00f, 8.0f, 4.0f, 8000.0f, 0.75f, 1.0f, 0.35f },   // shimmer - 1/64 note,  8 beats
+        { 1.0f / 64.0f, 0.40f, 1.7f, 0.94f, 5000.0f, 0.60f, 0.8f, 0.0f  },   // room    - 1/256 note, 1.7 beats
+        { 1.0f / 16.0f, 1.00f, 5.1f, 2.72f, 7000.0f, 0.72f, 1.0f, 0.0f  },   // hall    - 1/64 note,  5.1 beats
+        { 1.0f / 32.0f, 0.65f, 4.25f, 2.38f, 9000.0f, 0.75f, 1.0f, 0.0f  },   // plate   - 1/128 note, 4.25 beats
+        { 3.0f / 64.0f, 0.90f, 3.4f, 1.87f, 6500.0f, 0.70f, 1.0f, 0.0f  },   // chamber - 3/256 note, 3.4 beats
+        { 1.0f / 16.0f, 1.00f, 6.8f, 3.4f, 8000.0f, 0.75f, 1.0f, 0.35f },   // shimmer - 1/64 note,  6.8 beats
     };
     static constexpr float kLineMs[kLines] = { 29.7f, 37.1f, 41.1f, 43.7f, 53.3f, 59.9f, 67.7f, 73.1f };
     static constexpr float kDiffMs[kDiff]  = { 4.7f, 3.6f, 12.7f, 9.3f };

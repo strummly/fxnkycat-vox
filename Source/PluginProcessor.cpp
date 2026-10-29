@@ -417,7 +417,10 @@ void VocalChainProcessor::processBlock (juce::AudioBuffer<float>& buffer, juce::
 
         // 9. Delay
         if (on (delayOn))
+        {
+            delay.setVocalRange (vocalRange);   // echo mid dip follows the top-bar vocal range
             runStatic (8, ch, nch, len, [&] { delay.process (ch, nch, len, delaySec, delayMix->load() * 0.01f); });
+        }
 
         // 10. Reverb (ducks under the vocal, swells in the gaps).
         // Meter: left bar = how much reverb is being added, right bar = how far it is ducked.

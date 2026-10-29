@@ -125,6 +125,7 @@ namespace ui
         void setReversed (bool r) { reversed = r; repaint(); }   // show the last option first
         // Text-only look: no box, selected word gold, the others grey (like the stage names).
         void setTextOnly (bool t) { textOnly = t; setMouseCursor (juce::MouseCursor::PointingHandCursor); repaint(); }
+        void setUpperCase() { for (auto& o : options) o = o.toUpperCase(); repaint(); }   // show the options in capitals
         void mouseMove (const juce::MouseEvent&) override;
         void mouseExit (const juce::MouseEvent&) override;
     private:
@@ -216,7 +217,7 @@ private:
     ui::LedButton autoGainButton;                                  // output auto gain (light glows when on)
     ui::LedButton bypassButton;                                     // whole-plugin bypass (light glows orange when on)
 
-    // Presets: 10 user slots
+    // Presets: 9 user slots
     juce::ComboBox   presetBox;
     juce::TextButton saveButton { "SAVE" };
     ui::ArrowButton  colourButton;   // opens the accent colour menu

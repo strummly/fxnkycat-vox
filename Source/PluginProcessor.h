@@ -81,10 +81,10 @@ public:
     static juce::AudioProcessorValueTreeState::ParameterLayout createLayout();
     static juce::StringArray divisionNames();
 
-    // User presets: 10 slots saved as XML files shared by every project/DAW.
-    static constexpr int kNumPresets = 10;
+    // User presets: 9 slots saved as XML files shared by every project/DAW.
+    static constexpr int kNumPresets = 9;
     static juce::File presetFolder();
-    static juce::File presetFile (int slot);          // slot 0-9
+    static juce::File presetFile (int slot);          // slot 0-8
     juce::String presetName (int slot) const;         // empty if the slot is unused
     bool savePreset (int slot, const juce::String& name);
     bool loadPreset (int slot);

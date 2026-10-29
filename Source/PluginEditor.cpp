@@ -21,6 +21,13 @@ namespace
     };
     constexpr int kNumAccents = (int) (sizeof (kAccents) / sizeof (kAccents[0]));
 
+    // Dropdown items are shown in capitals.
+    juce::StringArray allCaps (juce::StringArray items)
+    {
+        for (auto& s : items) s = s.toUpperCase();
+        return items;
+    }
+
     juce::Colour accent { kAccents[0].argb };
     int accentIndex = 0;
     int accentVersion = 0;   // bumps on every change, so open windows know to repaint
@@ -768,6 +775,7 @@ VocalChainEditor::VocalChainEditor (VocalChainProcessor& p)
     {
         rangeSwitch = std::make_unique<ui::SegmentedSwitch> (*range);
         rangeSwitch->setTextOnly (true);
+        rangeSwitch->setUpperCase();   // BASS/BARITONE, TENOR/ALTO, MEZZO/SOPRANO
         addAndMakeVisible (*rangeSwitch);
     }
 
@@ -837,7 +845,7 @@ VocalChainEditor::VocalChainEditor (VocalChainProcessor& p)
         addAndMakeVisible (panel);
 
     // Global Timing note value, top right. Scroll the mouse wheel over it or click to pick.
-    timingBox.addItemList (VocalChainProcessor::divisionNames(), 1);
+    timingBox.addItemList (allCaps (VocalChainProcessor::divisionNames()), 1);
     timingBox.setJustificationType (juce::Justification::centred);
     timingBox.setScrollWheelEnabled (true);
     comboAtts.push_back (std::make_unique<APVTS::ComboBoxAttachment> (proc.apvts, "division", timingBox));
@@ -943,9 +951,9 @@ void VocalChainEditor::showColourMenu()
 {
     juce::PopupMenu m;
     m.setLookAndFeel (&lnf);
-    m.addSectionHeader ("Accent colour");
+    m.addSectionHeader ("ACCENT COLOR");
     for (int i = 0; i < kNumAccents; ++i)
-        m.addItem (i + 1, kAccents[i].name, true, i == accentIndex);
+        m.addItem (i + 1, juce::String (kAccents[i].name).toUpperCase(), true, i == accentIndex);
 
     juce::Component::SafePointer<VocalChainEditor> safe (this);
     m.showMenuAsync (juce::PopupMenu::Options().withTargetComponent (&colourButton),
@@ -971,12 +979,12 @@ void VocalChainEditor::applySwap (bool s)
 void VocalChainEditor::refreshPresetList (int selectSlot)
 {
     presetBox.clear (juce::dontSendNotification);
-    presetBox.addItem ("-init-", kInitPresetId);   // resets everything to the defaults
+    presetBox.addItem ("-INIT-", kInitPresetId);   // resets everything to the defaults
     presetBox.addSeparator();
     for (int s = 0; s < VocalChainProcessor::kNumPresets; ++s)
     {
         const auto name = proc.presetName (s);
-        presetBox.addItem (juce::String (s + 1) + "   " + (name.isEmpty() ? "(empty)" : name), s + 1);
+        presetBox.addItem (juce::String (s + 1) + "   " + (name.isEmpty() ? juce::String ("(EMPTY)") : name.toUpperCase()), s + 1);
         presetBox.setItemEnabled (s + 1, name.isNotEmpty());   // empty slots can't be loaded
     }
     if (selectSlot >= 0)
@@ -993,7 +1001,7 @@ void VocalChainEditor::presetChosen()
 
 void VocalChainEditor::showSaveDialog()
 {
-    auto* w = new juce::AlertWindow ("Save preset", "Name it and choose one of the 10 slots.",
+    auto* w = new juce::AlertWindow ("Save preset", "Name it and choose one of the 9 slots.",
                                      juce::MessageBoxIconType::NoIcon, this);
     w->setLookAndFeel (&lnf);
 
@@ -1007,7 +1015,7 @@ void VocalChainEditor::showSaveDialog()
     {
         const auto name = proc.presetName (s);
         if (name.isEmpty() && firstEmpty < 0) firstEmpty = s;
-        slots.add ("Slot " + juce::String (s + 1) + (name.isEmpty() ? "  (empty)" : "  (replace \"" + name + "\")"));
+        slots.add ("SLOT " + juce::String (s + 1) + (name.isEmpty() ? juce::String ("  (EMPTY)") : "  (REPLACE \"" + name.toUpperCase() + "\")"));
     }
     w->addComboBox ("slot", slots, "Save to:");
     w->getComboBoxComponent ("slot")->setSelectedItemIndex (onSlot ? current : juce::jmax (0, firstEmpty));
@@ -1060,7 +1068,7 @@ std::unique_ptr<ui::LabeledControl> VocalChainEditor::choice (const char* id, co
 {
     auto box = std::make_unique<juce::ComboBox>();
     if (auto* param = dynamic_cast<juce::AudioParameterChoice*> (proc.apvts.getParameter (id)))
-        box->addItemList (param->choices, 1);
+        box->addItemList (allCaps (param->choices), 1);
     box->setJustificationType (juce::Justification::centred);
     comboAtts.push_back (std::make_unique<APVTS::ComboBoxAttachment> (proc.apvts, id, *box));
     return std::make_unique<ui::LabeledControl> (caption, std::move (box), true);
