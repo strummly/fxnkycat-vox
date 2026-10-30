@@ -56,7 +56,8 @@ public:
     static constexpr int kNumStages = 11;
     std::atomic<float> activity[kNumStages] {};
     // Second (left-hand) meter for stages with split meters, 0-1:
-    // rider = level over threshold, de-esser = detection, Pultec = low boost.
+    // rider = level over threshold, harmonics = warmth, de-esser = detection, Pultec = low boost,
+    // reverb = reverb being added.
     std::atomic<float> activity2[kNumStages] {};
 
     VocalChainProcessor();

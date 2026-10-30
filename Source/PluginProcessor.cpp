@@ -444,24 +444,21 @@ void VocalChainProcessor::processBlock (juce::AudioBuffer<float>& buffer, juce::
     // Dynamic stages report how many dB they are moving the level; 6 dB = fully lit.
     auto dynAct = [] (float& meter) { const float v = juce::jlimit (0.0f, 1.0f, meter / 6.0f); meter = 0; return v; };
 
-    // Static stages: compare the audio before and after the stage.
+    // Static stages: measure the effect itself (what the stage adds or changes in the
+    // sound), with any plain volume change taken out, so the bar shows the effect level.
     auto runStatic = [&] (int stage, float* const* ch, int nch, int len, auto&& fn)
     {
         for (int c = 0; c < nch; ++c)
             std::copy (ch[c], ch[c] + len, stageIn[(size_t) c].begin());
         fn();
-        double eIn = 0, eDiff = 0;
+        double eIn = 0, eOut = 0, cross = 0;
         for (int c = 0; c < nch; ++c)
             for (int i = 0; i < len; ++i)
             {
-                const float x = stageIn[(size_t) c][(size_t) i];
-                const float d = ch[c][i] - x;
-                eIn += x * x; eDiff += d * d;
+                const float x = stageIn[(size_t) c][(size_t) i], y = ch[c][i];
+                eIn += x * x; eOut += y * y; cross += x * y;
             }
-        if (eIn / (len * nch) < 1.0e-7)   // ignore near-silence (below about -70 dB)
-            return;
-        const float changeDb = 10.0f * std::log10 ((float) (eDiff / eIn) + 1.0e-12f);
-        stageAct[stage] = juce::jmax (stageAct[stage], juce::jlimit (0.0f, 1.0f, juce::jmap (changeDb, -40.0f, -10.0f, 0.0f, 1.0f)));
+        stageAct[stage] = juce::jmax (stageAct[stage], changeAct (vc::effectDb (eIn, eOut, cross, len * nch)));
     };
 
     // Process in chunks so per-stage measurement needs no allocation.
@@ -535,7 +532,12 @@ void VocalChainProcessor::processBlock (juce::AudioBuffer<float>& buffer, juce::
         if (on (colorOn))
         {
             warmthAir.setVocalRange (vocalRange);   // lift and air bands follow the top-bar vocal range
-            runStatic (3, ch, nch, len, [&] { warmthAir.process (ch, nch, len, warmth->load(), air->load()); });
+            warmthAir.process (ch, nch, len, warmth->load(), air->load());
+            // Two bars: left = warmth (how much it changes the sound), right = exciter (harmonics it adds)
+            float warmDb, airDb;
+            warmthAir.takeMeters (warmDb, airDb, len * nch);
+            stageAct2[3] = juce::jmax (stageAct2[3], changeAct (warmDb));
+            stageAct[3]  = juce::jmax (stageAct[3],  changeAct (airDb));
         }
         insertAfter (3);
 

@@ -724,7 +724,7 @@ VocalChainEditor::VocalChainEditor (VocalChainProcessor& p)
       rider     ("1", "Rider",           "Rides to target  |  noise floor  |  3 speeds", 1),
       comp1     ("2", "Gate/Pre-Esser",  "Auto gate  |  threshold sets the de-ess", 1),
       problemEQ ("3", "Problem EQ",      "Finds and cuts resonances: low, mid, high", 1),
-      warmAir   ("4", "Harmonics",       "Tube warmth  |  harmonic exciter", 2),
+      warmAir   ("4", "Harmonics",       "Tube warmth  |  harmonic exciter", 1),
       deEsser   ("5", "De-Esser",        "Finds the strongest S / SH and cuts it", 1),
       pultec    ("6", "Vintage EQ",      "EQP-1A style program equalizer", 2),
       comp2     ("7", "Compressor",      "Fast attack  |  auto release  |  auto makeup", 1),
@@ -764,9 +764,10 @@ VocalChainEditor::VocalChainEditor (VocalChainProcessor& p)
     comp1.setLedFromSecond (true);   // meter bar: de-esser, LED: gate
     bindEnable (comp1, "comp1On");
 
-    // 4. Harmonics: Exciter on top, Warmth below
-    warmAir.add (knob ("air", "Exciter"));
+    // 4. Harmonics: Warmth and Exciter side by side
     warmAir.add (knob ("warmth", "Warmth"));
+    warmAir.add (knob ("air", "Exciter"));
+    warmAir.setSplitMeter (true, true);   // left bar: warmth, right bar: exciter
     bindEnable (warmAir, "colorOn");
 
     // 3. Problem EQ (its vocal range switch lives in the top bar)
@@ -1596,7 +1597,7 @@ void VocalChainEditor::resized()
     rider.setBounds     (row1.removeFromLeft (w1 * 24 / 100));
     comp1.setBounds     (row1.removeFromLeft (w1 * 13 / 100));
     problemEQ.setBounds (row1.removeFromLeft (w1 * 14 / 100));
-    warmAir.setBounds   (row1.removeFromLeft (w1 * 13 / 100));
+    warmAir.setBounds   (row1.removeFromLeft (w1 * 21 / 100));
     deEsser.setBounds   (row1);
 
     auto row2 = r;

@@ -15,6 +15,17 @@ constexpr double kPi    = 3.14159265358979323846;
 
 inline float dbToGain (float db)  { return std::pow (10.0f, db * 0.05f); }
 inline float gainToDb (float g)   { return 20.0f * std::log10 (std::max (g, 1.0e-9f)); }
+
+// How much a stage changed the sound, ignoring any plain volume change: the energy left
+// in the output after taking away the best-matched copy of the input, in dB relative to
+// the input. Pure gain = -inf; added harmonics, echoes, reverb or tone changes show up.
+// eIn = sum of in^2, eOut = sum of out^2, cross = sum of in*out. -200 for near-silence.
+inline float effectDb (double eIn, double eOut, double cross, int samples)
+{
+    if (eIn / std::max (1, samples) < 1.0e-7) return -200.0f;   // below about -70 dB
+    const double residual = std::max (0.0, eOut - cross * cross / eIn);
+    return 10.0f * std::log10 ((float) (residual / eIn) + 1.0e-12f);
+}
 inline float timeCoef (double seconds, double fs) { return (float) std::exp (-1.0 / (seconds * fs)); }
 
 // One-pole smoother step: rise with 'att', fall with 'rel'.
@@ -1371,6 +1382,7 @@ struct WarmthAir
                 const float wm = w0 + (w - w0) * t;   // smoothed amounts (no zipper noise)
                 const float am = a0 + (a - a0) * t;
                 float x = d[i];
+                eIn += (double) x * x;
 
                 // --- Warmth ---
                 if (wm > 0.0f)
@@ -1388,7 +1400,13 @@ struct WarmthAir
                         wGain[c] = matchC * wGain[c] + (1.0f - matchC) * target;
                     }
                     s *= wGain[c];
+                    const float before = x;
                     x += (s - x) * std::min (1.0f, wm * 4.0f);  // fades in over the first 25 %
+                    eWarmOut += (double) x * x; eWarmCross += (double) before * x;
+                }
+                else
+                {
+                    eWarmOut += (double) x * x; eWarmCross += (double) x * x;   // unchanged
                 }
 
                 // --- Air ---
@@ -1400,11 +1418,24 @@ struct WarmthAir
                     const float th = std::tanh (3.0f * u);
                     const float gen = (th + 0.3f * th * th) * airEnv[c];       // asymmetric -> odd + even harmonics
                     const float top = genHp2.process (genHp1.process (gen, c), c);
-                    x += top * am * kAirLevel;
+                    const float added = top * am * kAirLevel;
+                    eAirAdd += (double) added * added;
+                    x += added;
                 }
                 d[i] = x;
             }
         }
+    }
+
+    // Meters: how much the warmth changes the sound (level change ignored) and how
+    // loud the exciter's added harmonics are, both in dB relative to the input.
+    double eIn = 0, eWarmOut = 0, eWarmCross = 0, eAirAdd = 0;
+    void takeMeters (float& warmDb, float& airDb, int samples)
+    {
+        warmDb = effectDb (eIn, eWarmOut, eWarmCross, samples);
+        airDb  = eIn / std::max (1, samples) < 1.0e-7 ? -200.0f
+               : 10.0f * std::log10 ((float) (eAirAdd / eIn) + 1.0e-12f);
+        eIn = eWarmOut = eWarmCross = eAirAdd = 0;
     }
 };
 
