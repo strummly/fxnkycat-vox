@@ -55,7 +55,7 @@ int VocalChainProcessor::knobMeterFor (const juce::String& id)
 {
     static const std::pair<const char*, int> map[] = {
         { "riderThresh", kmRiderFloor }, { "riderTarget", kmRiderRide }, { "comp1Thresh", kmPreEss },
-        { "deqThresh", kmProblemEQ }, { "warmth", kmWarmth }, { "air", kmExciter }, { "deessReduce", kmDeEss },
+        { "deqThresh", kmProblemEQ }, { "warmth", kmWarmth }, { "air", kmExciter }, { "deessReduce", kmDeEss }, { "deessSens", kmDeEssDetect },
         { "pLowBoost", kmLowBoost }, { "pLowAtten", kmLowAtten }, { "pHighBoost", kmHighBoost },
         { "pHighAtten", kmHighAtten }, { "comp2Thresh", kmComp }, { "tapeAmount", kmTape },
         { "delayMix", kmDelay }, { "revMix", kmReverb }, { "hpFreq", kmHighPass }, { "lpFreq", kmLowPass } };
@@ -569,7 +569,8 @@ void VocalChainProcessor::processBlock (juce::AudioBuffer<float>& buffer, juce::
             deEsser.process (ch, nch, len, deessSens->load(), deessReduce->load(), soloing);
             float m = deEsser.takeMeter();
             meter (4, kmDeEss, dynAct (m));   // Reduction knob: how much is being cut
-            deEsser.takeDetectMeter();        // (detection level is not shown)
+            // Detection knob: how far the S / SH goes over the detection threshold, full at 12 dB
+            meter (4, kmDeEssDetect, juce::jlimit (0.0f, 1.0f, deEsser.takeDetectMeter() / 12.0f));
         }
 
         if (! soloing)

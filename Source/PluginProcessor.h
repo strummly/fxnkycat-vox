@@ -60,7 +60,7 @@ public:
 
     // Knob meters, 0-1: how much of its effect each knob's part of a stage is adding or
     // removing right now (peak since the editor last read it). Shown inside the knob's arc.
-    enum KnobMeter { kmRiderFloor, kmRiderRide, kmPreEss, kmProblemEQ, kmWarmth, kmExciter, kmDeEss,
+    enum KnobMeter { kmRiderFloor, kmRiderRide, kmPreEss, kmProblemEQ, kmWarmth, kmExciter, kmDeEss, kmDeEssDetect,
                      kmLowBoost, kmLowAtten, kmHighBoost, kmHighAtten, kmComp, kmTape, kmDelay, kmReverb,
                      kmHighPass, kmLowPass, kNumKnobMeters };
     std::atomic<float> knobMeter[kNumKnobMeters] {};
