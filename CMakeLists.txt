@@ -29,7 +29,7 @@ else()
 endif()
 
 juce_add_plugin(VocalChain
-    COMPANY_NAME "fxnkycat"
+    COMPANY_NAME "catfxnk creative"
     BUNDLE_ID com.fxnkycat.vox
     PLUGIN_MANUFACTURER_CODE Fxnk
     PLUGIN_CODE FxVx
