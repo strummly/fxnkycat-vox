@@ -48,6 +48,8 @@ namespace ui
 
     // Knob drawing. A slider with the "fillRight" property set draws its gold arc from
     // the pointer to the right-hand end instead of from the left-hand start (thresholds).
+    // A slider with a "meter" property (0-1) shows it inside the coloured arc: the arc is
+    // dimmed and fills with full accent colour from its fixed end as the meter rises.
     class KnobLookAndFeel : public juce::LookAndFeel_V4
     {
     public:
@@ -149,11 +151,8 @@ namespace ui
         void mouseDown (const juce::MouseEvent&) override;
         void mouseMove (const juce::MouseEvent&) override;
         void mouseWheelMove (const juce::MouseEvent&, const juce::MouseWheelDetails&) override;
-        void setActivity (float v);   // 0-1, drives the LED and meter bar
-        // Split the meter into two bars side by side: left = v2 (setActivity2), right = setActivity.
-        // ledBoth: the LED follows whichever bar is higher (otherwise only the right one).
-        void setSplitMeter (bool s, bool ledBoth = false) { splitMeter = s; ledFollowsBoth = ledBoth; repaint(); }
-        // Single meter bar = setActivity, LED = setActivity2 (e.g. stage 2: bar = de-esser, LED = gate).
+        void setActivity (float v);   // 0-1, drives the LED
+        // LED follows setActivity2 instead (stage 2: LED = gate).
         void setLedFromSecond (bool b) { ledFromSecond = b; repaint(); }
         void setActivity2 (float v);
         void setNumber (const juce::String& n) { if (n != number) { number = n; repaint(); } }
@@ -169,9 +168,8 @@ namespace ui
         std::vector<int> colWeights;
         juce::Rectangle<float> ledArea() const;
         void turnOnFromControl (const juce::MouseEvent&);
-        juce::Rectangle<float> meterArea() const;
         float activity = 0.0f, activity2 = 0.0f;
-        bool  splitMeter = false, ledFollowsBoth = false, ledFromSecond = false;
+        bool  ledFromSecond = false;
         juce::String number, title, subtitle;
         int rows;
         std::vector<std::unique_ptr<LabeledControl>> controls;
@@ -200,7 +198,11 @@ private:
 
     VocalChainProcessor& proc;
     ui::KnobLookAndFeel lnf;
-    float shownActivity2[VocalChainProcessor::kNumStages] {};   // left-hand bars of split meters
+    float shownActivity2[VocalChainProcessor::kNumStages] {};   // stage 2's gate LED
+
+    // Knobs that show a meter inside their arc (see VocalChainProcessor::knobMeterFor).
+    struct MeterKnob { juce::Slider* slider; int index; float shown; };
+    std::vector<MeterKnob> meterKnobs;
 
     // Panels first so they are destroyed after the attachments below.
     ui::ModulePanel rider, comp1, problemEQ, warmAir, deEsser, pultec, comp2, tape, delay, reverb, filters;

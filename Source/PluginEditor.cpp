@@ -136,13 +136,16 @@ void SwitchButton::paintButton (juce::Graphics& g, bool highlighted, bool)
 void KnobLookAndFeel::drawRotarySlider (juce::Graphics& g, int x, int y, int w, int h, float pos,
                                         float startAngle, float endAngle, juce::Slider& s)
 {
-    if (! (bool) s.getProperties().getWithDefault ("fillRight", false))
+    const bool fillRight = (bool) s.getProperties().getWithDefault ("fillRight", false);
+    const auto meterVar  = s.getProperties()["meter"];
+    if (! fillRight && meterVar.isVoid())
     {
         LookAndFeel_V4::drawRotarySlider (g, x, y, w, h, pos, startAngle, endAngle, s);
         return;
     }
 
-    // Same look as LookAndFeel_V4, but the value arc runs from the pointer to the end.
+    // Same look as LookAndFeel_V4. Threshold knobs: the value arc runs from the pointer to the end.
+    // Metered knobs: the value arc is dimmed and the meter fills it in full colour from its fixed end.
     const auto bounds = juce::Rectangle<int> (x, y, w, h).toFloat().reduced (10.0f);
     const float radius  = juce::jmin (bounds.getWidth(), bounds.getHeight()) / 2.0f;
     const float toAngle = startAngle + pos * (endAngle - startAngle);
@@ -155,12 +158,33 @@ void KnobLookAndFeel::drawRotarySlider (juce::Graphics& g, int x, int y, int w, 
     g.setColour (s.findColour (juce::Slider::rotarySliderOutlineColourId));
     g.strokePath (back, stroke);
 
-    if (s.isEnabled() && pos < 1.0f)
+    const float from = fillRight ? toAngle : startAngle, to = fillRight ? endAngle : toAngle;
+    if (s.isEnabled() && to - from > 0.001f)
     {
+        const auto fill = s.findColour (juce::Slider::rotarySliderFillColourId);
         juce::Path value;
-        value.addCentredArc (bounds.getCentreX(), bounds.getCentreY(), arcR, arcR, 0.0f, toAngle, endAngle, true);
-        g.setColour (s.findColour (juce::Slider::rotarySliderFillColourId));
-        g.strokePath (value, stroke);
+        value.addCentredArc (bounds.getCentreX(), bounds.getCentreY(), arcR, arcR, 0.0f, from, to, true);
+        if (meterVar.isVoid())
+        {
+            g.setColour (fill);
+            g.strokePath (value, stroke);
+        }
+        else
+        {
+            g.setColour (fill.withAlpha (0.35f));
+            g.strokePath (value, stroke);
+            // Meter: grows from the arc's fixed end (start, or the right-hand end on threshold knobs).
+            const float m = juce::jlimit (0.0f, 1.0f, (float) (double) meterVar);
+            if (m > 0.005f)
+            {
+                const float span = (to - from) * m;
+                juce::Path lit;
+                if (fillRight) lit.addCentredArc (bounds.getCentreX(), bounds.getCentreY(), arcR, arcR, 0.0f, to - span, to, true);
+                else           lit.addCentredArc (bounds.getCentreX(), bounds.getCentreY(), arcR, arcR, 0.0f, from, from + span, true);
+                g.setColour (fill);
+                g.strokePath (lit, stroke);
+            }
+        }
     }
 
     const float thumbW = lineW * 2.0f;
@@ -549,19 +573,11 @@ juce::Rectangle<float> ModulePanel::ledArea() const
     return { r.getRight() - 12.0f, r.getY() + 3.0f, 12.0f, 12.0f };
 }
 
-juce::Rectangle<float> ModulePanel::meterArea() const
-{
-    // Thin bar along the bottom of the header.
-    auto r = getLocalBounds().reduced (14, 10).toFloat();
-    return { r.getX(), r.getY() + 40.0f, r.getWidth(), 3.0f };
-}
-
 void ModulePanel::setActivity (float v)
 {
     if (std::abs (v - activity) < 0.004f) return;
     activity = v;
     repaint (ledArea().expanded (8.0f).getSmallestIntegerContainer());
-    repaint (meterArea().expanded (2.0f).getSmallestIntegerContainer());
 }
 
 void ModulePanel::setActivity2 (float v)
@@ -569,7 +585,6 @@ void ModulePanel::setActivity2 (float v)
     if (std::abs (v - activity2) < 0.004f) return;
     activity2 = v;
     repaint (ledArea().expanded (8.0f).getSmallestIntegerContainer());
-    repaint (meterArea().expanded (2.0f).getSmallestIntegerContainer());
 }
 
 void ModulePanel::turnOnFromControl (const juce::MouseEvent& e)
@@ -612,9 +627,9 @@ void ModulePanel::paint (juce::Graphics& g)
     const auto led = ledArea();
     const bool  isOn = enable.getToggleState();
     const float a  = isOn ? activity : 0.0f;
-    const float a2 = isOn && (splitMeter || ledFromSecond) ? activity2 : 0.0f;
+    const float a2 = isOn && ledFromSecond ? activity2 : 0.0f;
     const juce::Colour hot { 0xffff7a3d };
-    const float la = ledFromSecond ? a2 : (ledFollowsBoth ? juce::jmax (a, a2) : a);
+    const float la = ledFromSecond ? a2 : a;
     if (la > 0.02f)
     {
         g.setColour (hot.withAlpha (0.35f * la));
@@ -625,27 +640,12 @@ void ModulePanel::paint (juce::Graphics& g)
     g.setColour (bg.withAlpha (0.6f));
     g.drawEllipse (led, 1.0f);
 
-    // Activity meter bar (or two side by side: left = activity2, right = activity)
-    auto drawBar = [&] (juce::Rectangle<float> m, float v)
+    // Divider under the header (the meters now live in the knobs)
     {
+        const auto d = getLocalBounds().reduced (14, 10).toFloat();
         g.setColour (bg);
-        g.fillRoundedRectangle (m, 1.5f);
-        if (v > 0.0f)
-        {
-            g.setColour (accent.interpolatedWith (hot, v));
-            g.fillRoundedRectangle (m.withWidth (m.getWidth() * v), 1.5f);
-        }
-    };
-    if (splitMeter)
-    {
-        auto m = meterArea();
-        constexpr float barGap = 8.0f;
-        const float half = (m.getWidth() - barGap) * 0.5f;
-        drawBar (m.removeFromLeft (half), a2);
-        drawBar (m.removeFromRight (half), a);
+        g.fillRoundedRectangle ({ d.getX(), d.getY() + 40.0f, d.getWidth(), 3.0f }, 1.5f);
     }
-    else
-        drawBar (meterArea(), a);
 
     auto header = getLocalBounds().reduced (14, 10).removeFromTop (34).withTrimmedRight (24);  // leave room for the LED
     g.setColour (accent);
@@ -669,7 +669,7 @@ void ModulePanel::resized()
         const int tw = (int) std::ceil (juce::GlyphArrangement::getStringWidth (TitleToggle::font(), title)) + 4;
         enable.setBounds (t.withWidth (juce::jmin (tw, t.getWidth())));
     }
-    r.removeFromTop (10);   // room for the activity meter
+    r.removeFromTop (10);   // space under the header divider
 
     const int n = (int) controls.size();
     if (n == 0) return;
@@ -756,7 +756,6 @@ VocalChainEditor::VocalChainEditor (VocalChainProcessor& p)
     rider.add (knob ("riderThresh", "Noise Floor"));
     rider.add (knob ("riderTarget", "Target Loudness"));
     rider.setTopWide (true);
-    rider.setSplitMeter (true);   // left bar: level over the noise floor, right bar: how much it moves the level
     bindEnable (rider, "riderOn");
 
     // 2. Light compressor
@@ -767,7 +766,6 @@ VocalChainEditor::VocalChainEditor (VocalChainProcessor& p)
     // 4. Harmonics: Warmth and Exciter side by side
     warmAir.add (knob ("warmth", "Warmth"));
     warmAir.add (knob ("air", "Exciter"));
-    warmAir.setSplitMeter (true, true);   // left bar: warmth, right bar: exciter
     bindEnable (warmAir, "colorOn");
 
     // 3. Problem EQ (its vocal range switch lives in the top bar)
@@ -793,7 +791,6 @@ VocalChainEditor::VocalChainEditor (VocalChainProcessor& p)
     }
     deEsser.add (knob ("deessReduce", "Reduction"));
     deEsser.setColumnWeights ({ 5, 2, 5 });
-    deEsser.setSplitMeter (true);   // left bar: detection, right bar: reduction
     bindEnable (deEsser, "deessOn");
 
     // 5. Pultec — laid out like the hardware: low section on top, high section below.
@@ -805,7 +802,6 @@ VocalChainEditor::VocalChainEditor (VocalChainProcessor& p)
     pultec.add (knob ("pHighBoost", "High Boost"));
     pultec.add (knob ("pBandwidth", "Bandwidth (Sharp-Broad)"));
     pultec.add (knob ("pHighAtten", "High Atten"));
-    pultec.setSplitMeter (true, true);   // left bar: low boost, right bar: high boost
     bindEnable (pultec, "pultecOn");
 
     // 6. Compressor
@@ -842,7 +838,6 @@ VocalChainEditor::VocalChainEditor (VocalChainProcessor& p)
     }
     reverb.add (knob ("revMix", "Mix"));
     reverb.setSideStack (true);
-    reverb.setSplitMeter (true, true);   // left bar: reverb being added, right bar: how far it is ducked
     bindEnable (reverb, "reverbOn");
 
     for (auto* panel : { &rider, &comp1, &problemEQ, &warmAir, &deEsser, &pultec, &comp2, &tape, &delay, &reverb, &filters })
@@ -952,10 +947,21 @@ void VocalChainEditor::timerCallback()
         if (shownActivity[s] < 0.01f) shownActivity[s] = 0.0f;
         panels[s]->setActivity (shownActivity[s]);
 
-        // Left-hand bar of split meters (ignored by panels without one)
+        // Stage 2's gate LED (ignored by the other panels)
         shownActivity2[s] = juce::jmax (proc.activity2[s].exchange (0.0f), shownActivity2[s] * 0.82f);
         if (shownActivity2[s] < 0.01f) shownActivity2[s] = 0.0f;
         panels[s]->setActivity2 (shownActivity2[s]);
+    }
+
+    // Meters inside the knobs: jump up, fade out over roughly a quarter second.
+    for (auto& k : meterKnobs)
+    {
+        float v = juce::jmax (proc.knobMeter[k.index].exchange (0.0f), k.shown * 0.82f);
+        if (v < 0.01f) v = 0.0f;
+        if (std::abs (v - k.shown) < 0.004f) continue;
+        k.shown = v;
+        k.slider->getProperties().set ("meter", v);
+        k.slider->repaint();
     }
 
 
@@ -1490,6 +1496,11 @@ std::unique_ptr<ui::LabeledControl> VocalChainEditor::knob (const char* id, cons
     s->setTextBoxStyle (juce::Slider::TextBoxBelow, false, 80, 20);
     if (juce::String (id).endsWith ("Thresh"))
         s->getProperties().set ("fillRight", true);   // gold arc from the pointer to the right end
+    if (const int m = VocalChainProcessor::knobMeterFor (id); m >= 0)
+    {
+        s->getProperties().set ("meter", 0.0f);   // effect meter inside the arc, updated by the timer
+        meterKnobs.push_back ({ s.get(), m, 0.0f });
+    }
     sliderAtts.push_back (std::make_unique<APVTS::SliderAttachment> (proc.apvts, id, *s));
     return std::make_unique<ui::LabeledControl> (caption, std::move (s), false);
 }

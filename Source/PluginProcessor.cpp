@@ -51,6 +51,19 @@ juce::StringArray VocalChainProcessor::insertPositionNames()
              "After Reverb" };
 }
 
+int VocalChainProcessor::knobMeterFor (const juce::String& id)
+{
+    static const std::pair<const char*, int> map[] = {
+        { "riderThresh", kmRiderFloor }, { "riderTarget", kmRiderRide }, { "comp1Thresh", kmPreEss },
+        { "deqThresh", kmProblemEQ }, { "warmth", kmWarmth }, { "air", kmExciter }, { "deessReduce", kmDeEss },
+        { "pLowBoost", kmLowBoost }, { "pLowAtten", kmLowAtten }, { "pHighBoost", kmHighBoost },
+        { "pHighAtten", kmHighAtten }, { "comp2Thresh", kmComp }, { "tapeAmount", kmTape },
+        { "delayMix", kmDelay }, { "revMix", kmReverb }, { "hpFreq", kmHighPass }, { "lpFreq", kmLowPass } };
+    for (auto& [name, idx] : map)
+        if (id == name) return idx;
+    return -1;
+}
+
 VocalChainProcessor::~VocalChainProcessor()
 {
     cancelPendingUpdate();
@@ -436,17 +449,25 @@ void VocalChainProcessor::processBlock (juce::AudioBuffer<float>& buffer, juce::
     const float c2Ratio  = on (comp2Ratio4) ? 4.0f : 3.0f;
     const float c2Makeup = 0.5f * -c2Thresh * (1.0f - 1.0f / c2Ratio);
 
-    float stageAct[kNumStages] {}, stageAct2[kNumStages] {};
+    float stageAct[kNumStages] {}, stageAct2[kNumStages] {}, km[kNumKnobMeters] {};
 
-    // Change in dB (relative to the input) -> 0-1, same scale as the static stages.
+    // Knob meter for a stage: also lights the stage's LED.
+    auto meter = [&] (int stage, int k, float v)
+    {
+        km[k] = juce::jmax (km[k], v);
+        stageAct[stage] = juce::jmax (stageAct[stage], v);
+    };
+
+    // Signal added or removed, in dB relative to the input -> 0-1 (-40 dB = empty, -10 dB = full).
     auto changeAct = [] (float changeDb) { return juce::jlimit (0.0f, 1.0f, juce::jmap (changeDb, -40.0f, -10.0f, 0.0f, 1.0f)); };
+    // Signal a filter / attenuator cuts away -> 0-1 (-30 dB = empty, -6 dB = full), so tiny cuts don't light it.
+    auto cutAct = [] (float cutDb) { return juce::jlimit (0.0f, 1.0f, juce::jmap (cutDb, -30.0f, -6.0f, 0.0f, 1.0f)); };
 
-    // Dynamic stages report how many dB they are moving the level; 6 dB = fully lit.
-    auto dynAct = [] (float& meter) { const float v = juce::jlimit (0.0f, 1.0f, meter / 6.0f); meter = 0; return v; };
+    // Gain reduction (or ride) in dB -> 0-1; 'fullDb' = full.
+    auto dynAct = [] (float& m, float fullDb = 6.0f) { const float v = juce::jlimit (0.0f, 1.0f, m / fullDb); m = 0; return v; };
 
-    // Static stages: measure the effect itself (what the stage adds or changes in the
-    // sound), with any plain volume change taken out, so the bar shows the effect level.
-    auto runStatic = [&] (int stage, float* const* ch, int nch, int len, auto&& fn)
+    // Tape: measure what it adds or changes in the sound, with any plain volume change taken out.
+    auto runStatic = [&] (float* const* ch, int nch, int len, auto&& fn)
     {
         for (int c = 0; c < nch; ++c)
             std::copy (ch[c], ch[c] + len, stageIn[(size_t) c].begin());
@@ -458,7 +479,7 @@ void VocalChainProcessor::processBlock (juce::AudioBuffer<float>& buffer, juce::
                 const float x = stageIn[(size_t) c][(size_t) i], y = ch[c][i];
                 eIn += x * x; eOut += y * y; cross += x * y;
             }
-        stageAct[stage] = juce::jmax (stageAct[stage], changeAct (vc::effectDb (eIn, eOut, cross, len * nch)));
+        return vc::effectDb (eIn, eOut, cross, len * nch);
     };
 
     // Process in chunks so per-stage measurement needs no allocation.
@@ -493,10 +514,8 @@ void VocalChainProcessor::processBlock (juce::AudioBuffer<float>& buffer, juce::
         if (on (riderOn))
         {
             rider.process (ch, nch, len, riderThresh->load(), riderTarget->load());
-            stageAct[0] = juce::jmax (stageAct[0], dynAct (rider.meter));
-            // Left bar: how far the level goes over the noise floor, full at 12 dB
-            stageAct2[0] = juce::jmax (stageAct2[0], juce::jlimit (0.0f, 1.0f, rider.overMeter / 12.0f));
-            rider.overMeter = 0;
+            meter (0, kmRiderRide,  dynAct (rider.rideMeter));                                   // ride, full at 6 dB
+            meter (0, kmRiderFloor, dynAct (rider.floorMeter, vc::VolumeRider::kFloorDepthDb));       // noise pulled down, full at 12 dB
         }
         insertAfter (0);
 
@@ -507,7 +526,7 @@ void VocalChainProcessor::processBlock (juce::AudioBuffer<float>& buffer, juce::
             compGate.setTiming (unit);   // gate hold / close follow the Timing note
             // Threshold = de-ess only. Gate opens at the rider's Noise Floor when the rider is on, else automatic.
             compGate.process (ch, nch, len, comp1Thresh->load(), on (riderOn), riderThresh->load());
-            stageAct[1]  = juce::jmax (stageAct[1],  dynAct (compGate.meter));       // meter bar: de-esser
+            km[kmPreEss] = juce::jmax (km[kmPreEss], dynAct (compGate.meter));        // threshold knob: de-ess
             stageAct2[1] = juce::jmax (stageAct2[1], dynAct (compGate.gateMeter));   // LED: gate
         }
         insertAfter (1);
@@ -517,7 +536,7 @@ void VocalChainProcessor::processBlock (juce::AudioBuffer<float>& buffer, juce::
         {
             problemEQ.process (ch, nch, len, deqThresh->load(), vocalRange);
             float m = problemEQ.takeMeter();
-            stageAct[2] = juce::jmax (stageAct[2], dynAct (m));
+            meter (2, kmProblemEQ, dynAct (m));
         }
         insertAfter (2);
 
@@ -533,11 +552,11 @@ void VocalChainProcessor::processBlock (juce::AudioBuffer<float>& buffer, juce::
         {
             warmthAir.setVocalRange (vocalRange);   // lift and air bands follow the top-bar vocal range
             warmthAir.process (ch, nch, len, warmth->load(), air->load());
-            // Two bars: left = warmth (how much it changes the sound), right = exciter (harmonics it adds)
+            // Warmth: how much it changes the sound; Exciter: the harmonics it adds
             float warmDb, airDb;
             warmthAir.takeMeters (warmDb, airDb, len * nch);
-            stageAct2[3] = juce::jmax (stageAct2[3], changeAct (warmDb));
-            stageAct[3]  = juce::jmax (stageAct[3],  changeAct (airDb));
+            meter (3, kmWarmth,  changeAct (warmDb));
+            meter (3, kmExciter, changeAct (airDb));
         }
         insertAfter (3);
 
@@ -549,9 +568,8 @@ void VocalChainProcessor::processBlock (juce::AudioBuffer<float>& buffer, juce::
             deEsser.setRange (vocalRange);
             deEsser.process (ch, nch, len, deessSens->load(), deessReduce->load(), soloing);
             float m = deEsser.takeMeter();
-            stageAct[4] = juce::jmax (stageAct[4], dynAct (m));
-            // Detection: how far the s/sh goes over the threshold, full scale at 12 dB.
-            stageAct2[4] = juce::jmax (stageAct2[4], juce::jlimit (0.0f, 1.0f, deEsser.takeDetectMeter() / 12.0f));
+            meter (4, kmDeEss, dynAct (m));   // Reduction knob: how much is being cut
+            deEsser.takeDetectMeter();        // (detection level is not shown)
         }
 
         if (! soloing)
@@ -565,11 +583,13 @@ void VocalChainProcessor::processBlock (juce::AudioBuffer<float>& buffer, juce::
                            (int) pHighFreq->load(), pHighBoost->load(), pBandwidth->load(),
                            (int) pHighAttFreq->load(), pHighAtten->load());
             pultec.process (ch, nch, len);
-            // Two bars: left = low boost, right = high boost
-            float lowDb, highDb;
-            pultec.takeMeters (lowDb, highDb, len * nch);
-            stageAct2[5] = juce::jmax (stageAct2[5], changeAct (lowDb));
-            stageAct[5]  = juce::jmax (stageAct[5],  changeAct (highDb));
+            // Boost knobs: what they add; Atten knobs: what they take away
+            float lowB, lowA, highB, highA;
+            pultec.takeMeters (lowB, lowA, highB, highA, len * nch);
+            meter (5, kmLowBoost,  changeAct (lowB));
+            meter (5, kmLowAtten,  cutAct (lowA));
+            meter (5, kmHighBoost, changeAct (highB));
+            meter (5, kmHighAtten, cutAct (highA));
         };
 
         // 6/7. Compressor (meter shows gain reduction, not makeup)
@@ -577,7 +597,7 @@ void VocalChainProcessor::processBlock (juce::AudioBuffer<float>& buffer, juce::
         {
             if (! on (comp2On)) return;
             comp2.process (ch, nch, len, c2Thresh, c2Ratio, c2Makeup, true);
-            stageAct[6] = juce::jmax (stageAct[6], dynAct (comp2.meter));
+            meter (6, kmComp, dynAct (comp2.meter));
         };
 
         // Order: Pultec EQ then Compressor (default), or Compressor first when swapped
@@ -586,34 +606,38 @@ void VocalChainProcessor::processBlock (juce::AudioBuffer<float>& buffer, juce::
 
         // 8. Tape saturation
         if (on (tapeOn))
-            runStatic (7, ch, nch, len, [&] { tape.process (ch, nch, len, tapeAmount->load(), on (tapeOD)); });
+            meter (7, kmTape, changeAct (runStatic (ch, nch, len, [&] { tape.process (ch, nch, len, tapeAmount->load(), on (tapeOD)); })));
         insertAfter (7);
 
         // 9. Delay
         if (on (delayOn))
         {
             delay.setVocalRange (vocalRange);   // echo mid dip follows the top-bar vocal range
-            runStatic (8, ch, nch, len, [&] { delay.process (ch, nch, len, delaySec, delayMix->load() * 0.01f); });
+            delay.process (ch, nch, len, delaySec, delayMix->load() * 0.01f);
+            meter (8, kmDelay, changeAct (delay.takeMeter (len * nch)));   // level of the echoes
         }
         insertAfter (8);
 
         // 10. Reverb (ducks under the vocal, swells in the gaps).
-        // Meter: left bar = how much reverb is being added, right bar = how far it is ducked.
+        // Mix knob meter: level of the reverb being added.
         if (on (reverbOn))
         {
-            const float duckSoFar = stageAct[9];
-            stageAct[9] = 0.0f;
             reverb.setVocalRange (vocalRange);   // mid dip follows the top-bar vocal range
-            runStatic (9, ch, nch, len, [&] { reverb.process (ch, nch, len, revMix->load() * 0.01f); });
-            stageAct2[9] = juce::jmax (stageAct2[9], stageAct[9]);   // reverb being added
-            stageAct[9]  = juce::jmax (duckSoFar, juce::jlimit (0.0f, 1.0f, reverb.meter / vc::DuckingReverb::kDuckDb));
+            reverb.process (ch, nch, len, revMix->load() * 0.01f);
+            meter (9, kmReverb, changeAct (reverb.takeMeter (len * nch)));
             reverb.meter = 0;
         }
         insertAfter (9);
 
         // 11. High / low pass
         if (on (filterOn))
-            runStatic (10,ch, nch, len, [&] { passFilters.process (ch, nch, len, hpFreq->load(), lpFreq->load()); });
+        {
+            passFilters.process (ch, nch, len, hpFreq->load(), lpFreq->load());
+            float hpDb, lpDb;   // what each filter takes away
+            passFilters.takeMeters (hpDb, lpDb, len * nch);
+            meter (10, kmHighPass, cutAct (hpDb));
+            meter (10, kmLowPass,  cutAct (lpDb));
+        }
 
         // Auto gain: follow input and output loudness (~1 s average) and trim the
         // output so it matches the input, within +/-18 dB. Holds during silence.
@@ -667,6 +691,11 @@ void VocalChainProcessor::processBlock (juce::AudioBuffer<float>& buffer, juce::
         while (stageAct[s] > prev && ! activity[s].compare_exchange_weak (prev, stageAct[s])) {}
         float prev2 = activity2[s].load();
         while (stageAct2[s] > prev2 && ! activity2[s].compare_exchange_weak (prev2, stageAct2[s])) {}
+    }
+    for (int k = 0; k < kNumKnobMeters; ++k)
+    {
+        float prev = knobMeter[k].load();
+        while (km[k] > prev && ! knobMeter[k].compare_exchange_weak (prev, km[k])) {}
     }
 }
 

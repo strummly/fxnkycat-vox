@@ -55,10 +55,16 @@ public:
     // Order: rider, comp-gate, problem EQ, warmth/air, de-esser, pultec, compressor, tape, delay, reverb, filters.
     static constexpr int kNumStages = 11;
     std::atomic<float> activity[kNumStages] {};
-    // Second (left-hand) meter for stages with split meters, 0-1:
-    // rider = level over threshold, harmonics = warmth, de-esser = detection, Pultec = low boost,
-    // reverb = reverb being added.
+    // Stage 2's LED: how hard the gate is working, 0-1.
     std::atomic<float> activity2[kNumStages] {};
+
+    // Knob meters, 0-1: how much of its effect each knob's part of a stage is adding or
+    // removing right now (peak since the editor last read it). Shown inside the knob's arc.
+    enum KnobMeter { kmRiderFloor, kmRiderRide, kmPreEss, kmProblemEQ, kmWarmth, kmExciter, kmDeEss,
+                     kmLowBoost, kmLowAtten, kmHighBoost, kmHighAtten, kmComp, kmTape, kmDelay, kmReverb,
+                     kmHighPass, kmLowPass, kNumKnobMeters };
+    std::atomic<float> knobMeter[kNumKnobMeters] {};
+    static int knobMeterFor (const juce::String& paramId);   // -1 = this knob has no meter
 
     VocalChainProcessor();
     ~VocalChainProcessor() override;

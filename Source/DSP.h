@@ -26,6 +26,25 @@ inline float effectDb (double eIn, double eOut, double cross, int samples)
     const double residual = std::max (0.0, eOut - cross * cross / eIn);
     return 10.0f * std::log10 ((float) (residual / eIn) + 1.0e-12f);
 }
+
+// Meter averaging for filters: each 512-sample block keeps 98 % of the running sums (~0.5 s).
+// Short blocks aren't whole waveform cycles, so a filter's small time shift moves energy between
+// neighbouring blocks; averaging over many blocks cancels that out.
+constexpr double kMeterKeep = 0.98;
+
+// Energy a filter took away (before - after), in dB relative to 'ref' (the stage input).
+inline float removedDb (double before, double after, double ref)
+{
+    if (ref <= 0.0) return -200.0f;
+    return 10.0f * std::log10 ((float) (std::max (0.0, before - after) / ref) + 1.0e-12f);
+}
+
+// Energy a stage added (e.g. echoes, reverb), in dB relative to the input; -200 if silent.
+inline float addedDb (double eIn, double eAdded, int samples)
+{
+    if (eIn / std::max (1, samples) < 1.0e-7) return -200.0f;
+    return 10.0f * std::log10 ((float) (eAdded / eIn) + 1.0e-12f);
+}
 inline float timeCoef (double seconds, double fs) { return (float) std::exp (-1.0 / (seconds * fs)); }
 
 // One-pole smoother step: rise with 'att', fall with 'rel'.
@@ -168,8 +187,8 @@ struct VolumeRider
     static constexpr float kFloorDepthDb = 12.0f;
 
     float ms = 0, fastMs = 0, rideDb = 0, floorDb = 0;
-    float meter = 0;       // largest total gain change (dB, either direction) since last read
-    float overMeter = 0;   // most the level went over the noise floor (dB) since last read
+    float rideMeter  = 0;   // largest ride gain change (dB, either direction) since last read
+    float floorMeter = 0;   // most the noise floor pulled the level down (dB) since last read
     float rmsC = 0, downC = 0, upC = 0, maxRangeDb = 12.0f;
     float fastC = 0, floorDownC = 0, floorUpC = 0;
     double fs = 44100, lastBeat = -1;
@@ -219,7 +238,6 @@ struct VolumeRider
             // Ride: only listens to (and moves during) the singing.
             if (voice)
             {
-                overMeter = std::max (overMeter, fastDb - floorThreshDb);
                 ms = ms <= 0.0f ? fastMs : rmsC * ms + (1.0f - rmsC) * p;   // start from the first word's level
                 const float levelDb = 10.0f * std::log10 (ms + 1.0e-12f);
                 const float want = std::clamp (targetDb - levelDb, -maxRangeDb, maxRangeDb);
@@ -233,7 +251,8 @@ struct VolumeRider
             floorDb = fc * floorDb + (1.0f - fc) * floorWant;
 
             const float totalDb = rideDb + floorDb;
-            meter = std::max (meter, std::abs (totalDb));
+            rideMeter  = std::max (rideMeter, std::abs (rideDb));
+            floorMeter = std::max (floorMeter, -floorDb);
             const float g = dbToGain (totalDb);
             for (int ch_ = 0; ch_ < nch; ++ch_) ch[ch_][i] *= g;
         }
@@ -901,9 +920,9 @@ struct PultecEQ
         highAtten.makeHighShelf (fs, af, 0.6, -highAttenAmt * 1.6);        // up to -16 dB
     }
 
-    // Energy of the input, and of what the low and high boost sections each add,
-    // summed since the last takeMeters() (for the stage's two meter bars).
-    double eIn = 0, eLowAdd = 0, eHighAdd = 0;
+    // Energy of the input, of what the low and high boosts each add, and before/after
+    // each attenuator, summed since the last takeMeters() (for the knob meters).
+    double eIn = 0, eLowAdd = 0, eHighAdd = 0, eLowAttIn = 0, eLowAttOut = 0, eHighAttIn = 0, eHighAttOut = 0;
 
     void process (float* const* ch, int nch, int n)
     {
@@ -917,25 +936,34 @@ struct PultecEQ
                 const float lb = lowBoost.process (x, c);
                 eLowAdd += (double) (lb - x) * (lb - x);
                 x = lowAtten.process (lb, c);
+                eLowAttIn += (double) lb * lb; eLowAttOut += (double) x * x;
                 const float hb = highBoost.process (x, c);
                 eHighAdd += (double) (hb - x) * (hb - x);
                 x = highAtten.process (hb, c);
+                eHighAttIn += (double) hb * hb; eHighAttOut += (double) x * x;
                 d[i] = x;
             }
         }
     }
 
-    // How much each boost changes the sound, in dB relative to the input
-    // (-inf if silent). Resets the sums.
-    void takeMeters (float& lowDb, float& highDb, int samples)
+    // What each boost adds and each attenuator removes, in dB relative to the input
+    // (-200 if silent). Resets the sums.
+    // (Attenuators are averaged over ~0.5 s, like PassFilters, so phase shift doesn't read as a cut.)
+    double sIn = 0, sLowAttIn = 0, sLowAttOut = 0, sHighAttIn = 0, sHighAttOut = 0;
+    void takeMeters (float& lowBoostDb, float& lowAttDb, float& highBoostDb, float& highAttDb, int samples)
     {
-        if (eIn / std::max (1, samples) < 1.0e-7) { lowDb = highDb = -200.0f; }   // near-silence
+        sIn = sIn * kMeterKeep + eIn;
+        sLowAttIn  = sLowAttIn  * kMeterKeep + eLowAttIn;  sLowAttOut  = sLowAttOut  * kMeterKeep + eLowAttOut;
+        sHighAttIn = sHighAttIn * kMeterKeep + eHighAttIn; sHighAttOut = sHighAttOut * kMeterKeep + eHighAttOut;
+        if (eIn / std::max (1, samples) < 1.0e-7) { lowBoostDb = lowAttDb = highBoostDb = highAttDb = -200.0f; }
         else
         {
-            lowDb  = 10.0f * std::log10 ((float) (eLowAdd  / eIn) + 1.0e-12f);
-            highDb = 10.0f * std::log10 ((float) (eHighAdd / eIn) + 1.0e-12f);
+            lowBoostDb  = 10.0f * std::log10 ((float) (eLowAdd  / eIn) + 1.0e-12f);
+            highBoostDb = 10.0f * std::log10 ((float) (eHighAdd / eIn) + 1.0e-12f);
+            lowAttDb    = removedDb (sLowAttIn,  sLowAttOut,  sIn);
+            highAttDb   = removedDb (sHighAttIn, sHighAttOut, sIn);
         }
-        eIn = eLowAdd = eHighAdd = 0;
+        eIn = eLowAdd = eHighAdd = eLowAttIn = eLowAttOut = eHighAttIn = eHighAttOut = 0;
     }
 };
 
@@ -1075,6 +1103,10 @@ struct TempoDelay
     VocalDucker ducker;
     float duckMeter = 0;   // how far the echoes are ducked (dB), largest since last read
 
+    // Meter: level of the echoes you hear, in dB relative to the input. Resets the sums.
+    double eIn = 0, eEcho = 0;
+    float takeMeter (int samples) { const float m = addedDb (eIn, eEcho, samples); eIn = eEcho = 0; return m; }
+
     Biquad dip;            // -1 dB mid dip on the echoes you hear (not in the feedback loop)
     static constexpr double kDipHz[3] = { 1500.0, 2100.0, 3000.0 };   // bass/baritone, tenor/alto, mezzo/soprano
     int dipRange = -1;
@@ -1147,7 +1179,9 @@ struct TempoDelay
 
                 const float x = ch[c][i];
                 b[(size_t) writePos] = x + wet * kFeedback;   // repeats keep going at full level...
-                ch[c][i] = x * dryG + dip.process (wet, c) * duckG;   // ...only what you hear is ducked and dipped
+                const float heard = dip.process (wet, c) * duckG;   // ...only what you hear is ducked and dipped
+                ch[c][i] = x * dryG + heard;
+                eIn += (double) x * x; eEcho += (double) heard * heard;
             }
             writePos = (writePos + 1) % size;
         }
@@ -1180,8 +1214,26 @@ struct PassFilters
         {
             float* d = ch[c];
             for (int i = 0; i < n; ++i)
-                d[i] = lp2.process (lp1.process (hp2.process (hp1.process (d[i], c), c), c), c);
+            {
+                const float x = d[i];
+                const float h = hp2.process (hp1.process (x, c), c);
+                d[i] = lp2.process (lp1.process (h, c), c);
+                eIn += (double) x * x; eHp += (double) h * h; eLp += (double) d[i] * d[i];
+            }
         }
+    }
+
+    // Meters: what the high pass and the low pass each take away, in dB relative to the input.
+    // Averaged over ~0.5 s (kMeterKeep per call) so the filters' phase shift between short
+    // blocks doesn't read as removed signal.
+    double eIn = 0, eHp = 0, eLp = 0, sIn = 0, sHp = 0, sLp = 0;
+    void takeMeters (float& hpDb, float& lpDb, int samples)
+    {
+        const bool quiet = eIn / std::max (1, samples) < 1.0e-7;
+        sIn = sIn * kMeterKeep + eIn; sHp = sHp * kMeterKeep + eHp; sLp = sLp * kMeterKeep + eLp;
+        eIn = eHp = eLp = 0;
+        if (quiet) hpDb = lpDb = -200.0f;
+        else { hpDb = removedDb (sIn, sHp, sIn); lpDb = removedDb (sHp, sLp, sIn); }
     }
 };
 
@@ -1679,15 +1731,24 @@ struct DuckingReverb
             const float m = mix0 + (mix - mix0) * (float) (i + 1) / (float) n;
             const float g = m * kWetGain * dbToGain (duckDb + tailDb);
             auto filt = [&] (float v, int c) { return wetDip.process (wetLp.process (wetHp.process (v, c), c), c); };
+            auto add = [&] (int c, float wet)
+            {
+                eIn += (double) ch[c][i] * ch[c][i]; eWet += (double) wet * wet;
+                ch[c][i] += wet;
+            };
             if (nch > 1)
             {
-                ch[0][i] += filt (wl, 0) * g;
-                ch[1][i] += filt (wr, 1) * g;
+                add (0, filt (wl, 0) * g);
+                add (1, filt (wr, 1) * g);
             }
             else
-                ch[0][i] += filt (mid, 0) * g;
+                add (0, filt (mid, 0) * g);
         }
     }
+
+    // Meter: level of the reverb being added, in dB relative to the input. Resets the sums.
+    double eIn = 0, eWet = 0;
+    float takeMeter (int samples) { const float m = addedDb (eIn, eWet, samples); eIn = eWet = 0; return m; }
 };
 
 } // namespace vc
